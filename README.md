@@ -1,36 +1,56 @@
-# contest2026_393_jizhipai
+# AI-VOX3 桌面小跟班
 
-👋 欢迎参加 **2026 首届 openvela AI 硬件开发者大赛**！
+队伍：**竞智派（jizhipai）** · 队伍编号 **393** · 仓库 `contest2026_393_jizhipai`
 
-这是组委会为你的队伍创建的**专属参赛仓库**（本仓为样例/模板，队伍编号 `393`；你看到的将是你自己的 `contest2026_<编号>_<队伍名>`）。比赛期间，你的全部参赛代码、打包产物与 AI Coding 日志都提交到这里。
+## 一、作品简介
 
-> 本仓既是「代码仓」，又内置了一键拉取整套 openvela 工程的 `repo` 清单（manifest）。你只需跟它打交道，**自始至终只动一个文件夹**。
+基于 openvela（NuttX）在 **AI-VOX3（ESP32-S3-R8 + ES8311 + 240×240 ST7789 LCD）** 上做的
+一款可完全自主掌控的桌面语音对话终端：**按键即可完成「录音 → ASR → LLM → TTS → 播放」的完整对话**，
+同时在同一块屏上常驻显示时间、天气与网络状态，底部保留语音字幕。
 
----
+与闭源商用音箱的区别：代码全部开放、可二次开发、不绑定厂商云生态，
+并且针对**校园网（存在策略路由与专网出口）**做了公网 / 内网双后端降级。
 
-## 一、先读这些官方文档
+主要工作量在系统侧适配与修复：
 
-**通用（所有赛道必读）：**
+- 修复 ESP32-S3 **I2S 单端口全双工**时钟配置（TX 占用端口时 RX 被强制设为从模式，
+  而从模式所需的外部时钟并未送达 RX，导致录音长期返回 0 字节）
+- 补齐 RX **TDM 通道数**配置
+- 修复 **GDMA 完成队列竞态**（「装载 DMA → 启动 → 挂入完成队列」三步放进临界区，
+  否则传输在挂队之前完成时该帧事件永久丢失）
+- **IOB 缓冲池**由 64×196 扩到 160×512，网络就绪时间 **124 s → 5 s**
+- 定位 RX 首帧到达后的崩溃为 **WiFi 闭源 FIQ 与 GDMA RX 中断的并发冲突**
+  （`EXCCAUSE=001c` / `VADDR=0`；已用三档中断栈对照排除栈容量因素，实测峰值仅 336 B）
 
-| 文档                                                                                                                                     | 用途                                           |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| [《大赛总览》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/contest_overview.md)                        | 赛道、流程、评分、资源，建议先通读             |
-| [《参赛代码提交指南》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/code_submission_guide.md)           | 仓库获取、提交流程、时间与权限（**以此为准**） |
-| [《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md) | 如何导出 AI 对话日志并提交到 `logs/`           |
+## 二、选题方向
 
-**按你的赛道选读（三选一）：**
+**AI 硬件产品创新 + 新硬件平台适配**（两项组合）。
 
-| 赛道                  | 教程导航                                                                                                                                                 |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 快应用 / 手表应用创新 | [快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)                         |
-| AI 硬件产品创新       | [AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)              |
-| 新硬件适配            | [新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md) |
+- AI 硬件产品创新：语音对话 + 桌面信息屏的完整产品形态，含自定义工具与 Skill。
+- 新硬件平台适配：AI-VOX3 板级的 LCD（SPI3）、ES8311（I2C0）、I2S / GDMA 全链路驱动适配与修复。
 
----
+## 三、目录结构
 
-## 二、第一步：拉取完整工程
+```text
+ai_vox3/
+├── app/                     自研应用
+│   ├── info_screen/         信息屏（时间 / 天气 / 网络 / 语音字幕，3 页可切换）
+│   ├── status_indicator/    状态指示与状态条
+│   ├── day2_ui/             对话界面（LVGL）
+│   ├── my_ai_tool/          示例自定义工具
+│   └── hello_app/           示例应用
+├── packages_ai_agent/       ai_agent 框架（语音 / 网络 / 工具 / Skill 运行时）
+└── nuttx/                   内核与板级改动
+    ├── arch/xtensa/src/esp32s3/              I2S、GDMA 驱动修复
+    ├── boards/xtensa/esp32s3/esp32s3-eye/    板级配置与 bringup
+    └── drivers/audio/es8311.c                编解码器
+docs/                        技术文档（含 V399–V401 RX 崩溃排查复盘）
+logs/                        AI Coding 日志
+```
 
-用组委会提供的命令一键拉取「openvela 全量源码 + 你的专属仓」：
+## 四、运行方式
+
+### 1. 拉取工程
 
 ```bash
 repo init -u https://github.com/open-vela/contest2026_393_jizhipai \
@@ -38,111 +58,84 @@ repo init -u https://github.com/open-vela/contest2026_393_jizhipai \
 repo sync -c -j8
 ```
 
-同步后，你的整个仓库位于工作区的 `contest2026_393_jizhipai/`，openvela 全量源码在外层（`nuttx/`、`apps/`、`packages/`、`vendor/` 等）。
+### 2. 编译
 
----
-
-## 三、第二步：在哪里写代码
-
-**只在自己的仓目录 `contest2026_393_jizhipai/` 里开发。** 不同作品形态放在对应子目录，manifest 会通过 `<linkfile>` 把它们**软链**到 openvela 编译树该在的位置——你不用手动 copy：
-
-| 作品形态 | 你的代码放这里             | 系统自动映射到                                 |
-| -------- | -------------------------- | ---------------------------------------------- |
-| 应用     | `app/hello_app/`           | `packages/demos/contest2026_393_hello_app`     |
-| 快应用   | `quickapp/hello_quickapp/` | `packages/apps/contest2026_393_hello_quickapp` |
-| 板级适配 | `board/contest_board/`     | `vendor/openvela/boards/contest2026_393_board` |
-
-> 用不到的形态目录可以删掉；新增作品时按同样规则加子目录，并在 `contest2026_393_jizhipai.xml` 里补一条 `<linkfile>` 映射即可。**生产仓库（packages/nuttx/vendor 等）零改动。**
-
-建议仓库目录约定（便于评委定位）：
-
-```text
-app/ | quickapp/ | board/   # 你的作品代码
-logs/                       # AI Coding 日志（主动导出后提交，格式见 logs/README.md）
-README.md                   # 作品说明（提交前请改成你自己的，见第六节）
-```
-
-> 仓内附带了一个 `.gitignore.example`，给出了**编译产物**等不需要进仓的文件示例。如需启用，`cp .gitignore.example .gitignore` 后按需增删即可。**注意 `logs/` 下最终导出的 AI Coding 日志必须提交，不要忽略。**
->
-> `logs/` 的目录结构与提交格式见 [logs/README.md](logs/README.md)。
-
----
-
-## 四、第三步：编译与运行
-
-编译/运行步骤随作品形态不同而不同，请参考你所在赛道的教程导航：
-
-- 快应用 / 手表应用：[快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)（含模拟器与开发板部署）。
-- AI 硬件产品创新：[AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)（环境搭建、编译烧录、Skill 开发）。
-- 新硬件适配：[新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md)（BSP 移植、最小 NSH 基线）。
-
-子目录已通过 manifest 中的 `<linkfile>` 软链进 openvela 编译树，因此构建在 openvela 工作区**根目录**（即你这个仓的上一级）进行。openvela 使用 `build.sh` 作为统一入口，接收一个 **board config 路径**作为参数：
+在 openvela 工作区根目录（本仓的上一级）：
 
 ```bash
-# 进入 openvela 工作区根目录（你的仓的上一级）
-cd ..
-
-# 通用语法：第一个参数是 board config 路径，第二个参数可以是 menuconfig / distclean 等
-./build.sh <board-config-path> [menuconfig|distclean] [-j8]
+./build.sh vendor/openvela/boards/contest2026_393_esp32s3_eye/configs/ai_agent -j8
 ```
 
-> 具体的 board config 路径、目标产物、模拟器/真机部署方式请以你所在赛道的教程导航为准。本仓 `app/` `quickapp/` `board/` 三个示例骨架对应的 Kconfig 选项可通过 `menuconfig` 启用。
+产物：`nuttx/nuttx.bin`
 
----
+### 3. 烧录
 
-## 五、第四步：提交作品
+按住 **BOOT（GPIO0）** 上电进入下载模式：
 
-1. **fork** 你的专属仓 → 开发 → `git commit` 并推送 → 向专属仓发起 **Pull Request**，可**自行 review 并合入**（无需等组委会）。
-2. **AI Coding 日志**：与 AI 工具的对话会自动记录到本机 staging（不会自动上传），需你**主动导出/打包**选定会话到仓内 `logs/` 目录后一并提交。详见[《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md)。
-3. 若需改动 **nuttx 等公共仓库**，不在本仓改，而是 fork 对应公共仓、以 PR 提交到 `dev-ai-contest-2026` 分支，由组委会 review 后合入。
+```bash
+python -m esptool --chip esp32s3 --port <COM> write_flash 0x0 nuttx.bin
+```
 
-> ⏰ **提交作品截止：9 月 20 日**。截止后统一收回 push 权限，仍可查看 / clone。
->
-> 获奖后再按要求将作品 PR 至 openvela 上游对应仓库（走标准 PR + CI 流程）。
+烧完**松开 BOOT 并拔插 USB**（否则芯片会停在 ROM 下载模式，串口 0 字节）。
 
-### 关于 PR 与 CLA
+### 4. 运行
 
-- 本仓所有改动通过 **Pull Request** 合入（分支保护强制，可自行合入自己的 PR）。
-- 首次贡献需在[**官网签署 CLA**](https://openvela.com/#/community/cla)；PR 上会自动跑 `cla/signature` 检查，在官网签署成功后，在 PR 评论 `/check-cla` 复检即可通过。
+- 上电约 35 s 后自播开机问候语「桌面小跟班语音就绪」。
+- 按 **BOOT** 开始说话（松手或 8 s 自动结束录音）→ ASR → LLM → TTS 回播。
+- **VOL−（GPIO45）上一页 / VOL+（GPIO46）下一页**，共 3 页：
+  首页概览 / 网络详情 / 系统详情，右上角显示 `n/3`。
+- 也可以直接说「下一页」，由自定义工具 `ui_control` 下发 `next` / `prev` / `home`。
+- 语音字幕在所有页面底部常驻。
 
----
+### 5. 硬件接线（GPIO）
 
-## 六、提交前：把本 README 改成你的作品说明
+| 功能 | 引脚 |
+| --- | --- |
+| I2S MCLK / BCLK / WS | 11 / 10 / 8 |
+| I2S DOUT / DIN | 7 / 9 |
+| ES8311 I2C SDA / SCL | 13 / 12 |
+| LCD MOSI / CLK / DC / CS / BCKL | 21 / 17 / 14 / 15 / 16 |
+| BOOT（PTT） | GPIO0 |
+| VOL+ / VOL− | 46 / 45 |
 
-本文件目前是组委会给的**使用说明书**。**作品提交前，请把它替换成你自己作品的说明**，方便评委快速了解你做了什么、怎么跑起来。建议至少包含以下内容：
+### 6. 服务端端点
 
-```markdown
-# <你的作品名>
+语音与对话走云端，端点在编译期 seed 中（`esp32s3_bringup.c`、`http_tts.c`、`http_asr.c`）：
 
-## 一、作品简介
-<一句话/一段话说明这个作品是什么、解决什么问题、亮点在哪>
+- TTS：`http://42.48.185.89:2301/tts`
+- ASR：`http://42.48.185.89:9009/asr`
+- LLM：`http://42.48.185.89:2302/v1/chat/completions`
+- 内网备选：`http://172.16.88.1` 同端口
 
-## 二、选题方向
-<快应用 / 手表应用创新 ｜ AI 硬件产品创新 ｜ 新硬件适配 ｜ 自定方向，并简述理由>
-
-## 三、目录结构
-<列出你这个仓里各目录/文件的作用，例如：>
-- `app/xxx/`        — <说明>
-- `board/xxx/`      — <说明>
-- `quickapp/xxx/`   — <说明>
-- `logs/`           — AI Coding 日志
-- `docs/` 或其他    — <说明>
-
-## 四、运行方式
-<拉取工程后，如何编译、烧录/部署、运行的完整步骤；最好能让评委照着一步步复现>
+> `/data` 在本平台是 tmpfs，运行时改文件无效，端点只能改编译期 seed。
 
 ## 五、AI Coding 使用说明
-<说明本作品如何借助 AI 辅助开发：
-- 在需求拆解 / 方案设计 / 编码 / 调试 / 文档等环节如何与 AI 协作；
-- AI 对开发效率或质量带来的实际帮助。
-完整对话日志见 logs/ 目录>
-```
 
-> 提示：将会根据「作品本身 + 你的 README 说明 + `logs/` 里的 AI Coding 日志」来理解和评估你的作品，README 写清楚很重要。
+本作品全程借助 AI（WorkBuddy / CodeBuddy Agent）辅助开发，AI 参与率约 70%：
 
----
+- **需求拆解与方案设计**：由 AI 从「能语音对话的桌面终端」拆成采集 / 传输 / 合成 / 播放 / 显示五段，
+  并逐段设计可判定的验证方法。
+- **编码**：驱动修复（I2S 时钟、GDMA 临界区、IOB 与中断栈参数）与应用逻辑
+  （信息屏、UI 状态机、自定义工具）均由 AI 产出补丁脚本后逐版验证。
+- **调试**：崩溃定位从「人工读几千行串口日志」变成「关键字统计 + addr2line」，
+  一次定位从小时级压到分钟级。
+- **文档**：技术报告与本 README 由 AI 依据仓库与日志事实生成，保证与代码一致。
 
-## 附：仓库命名规范
+踩过的坑（已固化到排障纪律）：
 
-`contest2026_<编号>_<队伍名>` — 编号三位零填充；队名 slug（全小写、英文/拼音、连字符）。例：`contest2026_393_jizhipai`。
-（仓库由组委会统一创建，**每队仅一个仓**，无需自行命名。）
+1. AI 一度把故障归因于网络环境，后用「同板同网、UDP 通而 TCP 不通」的对照实验推翻，
+   改从软件栈容量入手。
+2. AI 连续三版按「中断栈不足」扩容无效，后改为**先测量再下结论**（实测峰值 336 B）
+   才转向并发方向。
+3. 外部包 Kconfig 符号（`CONFIG_AI_AGENT_VOICE_BOOT_TEST`）会被 nuttx `olddefconfig`
+   静默丢弃，`#ifdef` 包住的代码从未编译 → 此后一律改为显式宏门控并在 ELF 中校验符号。
+
+完整对话日志见 `logs/` 目录。
+
+## 六、已知不足与后续
+
+1. RX 中断与 WiFi 闭源 FIQ 的并发冲突尚未根治（当前用编译期开关 `CAPTURE_PROBE` 规避，
+   置 1 可复现）；下一步在 `xtensa_user_panic` 之前打点抓第一手异常，
+   并尝试在 RX 中断期间临界区屏蔽 WiFi FIQ 验证假设。
+2. 唤醒词尚未接入，当前为按键 PTT。
+3. 未做系统级低功耗优化。

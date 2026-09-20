@@ -1,0 +1,7 @@
+############################################################################
+# Day 2 UI Demo - Contest 2026 team 307
+############################################################################
+
+ifneq ($(CONFIG_LVX_CONTEST2026_307_DAY2_UI),)
+CONFIGURED_APPS += $(APPDIR)/packages/demos/contest2026_307_day2_ui
+endif

@@ -12,5 +12,13 @@
     <linkfile src="app/hello_app" dest="packages/demos/contest2026_393_hello_app"/>
     <linkfile src="quickapp/hello_quickapp" dest="packages/apps/contest2026_393_hello_quickapp"/>
     <linkfile src="board/contest_board" dest="vendor/openvela/boards/contest2026_393_board"/>
+
+    <!-- AI-VOX3 桌面小跟班：作品整体放在 ai_vox3/ 下，便于评委一次定位 -->
+    <linkfile src="ai_vox3/app/info_screen" dest="packages/demos/contest2026_393_info_screen"/>
+    <linkfile src="ai_vox3/app/status_indicator" dest="packages/demos/contest2026_393_status_indicator"/>
+    <linkfile src="ai_vox3/app/my_ai_tool" dest="packages/demos/contest2026_393_my_ai_tool"/>
+    <linkfile src="ai_vox3/app/day2_ui" dest="packages/demos/contest2026_393_day2_ui"/>
+    <linkfile src="ai_vox3/packages_ai_agent" dest="packages/ai_agent"/>
+    <linkfile src="ai_vox3/nuttx/boards/xtensa/esp32s3/esp32s3-eye" dest="vendor/openvela/boards/contest2026_393_esp32s3_eye"/>
   </project>
 </manifest>

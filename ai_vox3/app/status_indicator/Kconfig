@@ -1,0 +1,28 @@
+#
+# Status Indicator - Contest 2026 team 307
+#
+
+config LVX_CONTEST2026_307_STATUS_INDICATOR
+	bool "Status indicator system (status bar + motor)"
+	default n
+	depends on VIDEO_FB
+	---help---
+		设备状态指示系统：顶部 4px 状态色带 + 马达震动联动。
+		使用 framebuffer 直绘，不依赖 LVGL。
+		支持 Normal/Notify/Alert/Sleep 四种状态。
+
+if LVX_CONTEST2026_307_STATUS_INDICATOR
+
+config LVX_CONTEST2026_307_STATUS_INDICATOR_PROGNAME
+	string "Program name"
+	default "status_indicator"
+
+config LVX_CONTEST2026_307_STATUS_INDICATOR_PRIORITY
+	int "Task priority"
+	default 100
+
+config LVX_CONTEST2026_307_STATUS_INDICATOR_STACKSIZE
+	int "Stack size"
+	default 8192
+
+endif

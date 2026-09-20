@@ -1,0 +1,30 @@
+#
+# Info Screen - Contest 2026 team 307
+#
+
+config LVX_CONTEST2026_307_INFO_SCREEN
+	bool "Info screen (time + weather) on fb0"
+	default n
+	depends on VIDEO_FB
+	---help---
+		Framebuffer-rendered info page: big HH:MM clock on the first line and
+		"weekday weather temp" on the second line. Reads the weather from
+		/tmp/weather.txt (written by the ai_agent weather tool). Pure fb
+		direct-draw, no LVGL/FreeType. Falls back to "--" when time/weather
+		are unavailable.
+
+if LVX_CONTEST2026_307_INFO_SCREEN
+
+config LVX_CONTEST2026_307_INFO_SCREEN_PROGNAME
+	string "Program name"
+	default "info_screen"
+
+config LVX_CONTEST2026_307_INFO_SCREEN_PRIORITY
+	int "Task priority"
+	default 100
+
+config LVX_CONTEST2026_307_INFO_SCREEN_STACKSIZE
+	int "Stack size"
+	default 4096
+
+endif
