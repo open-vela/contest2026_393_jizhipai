@@ -1,0 +1,9 @@
+#
+# My AI Tool - Contest 2026 team 307
+#
+
+config LVX_CONTEST2026_307_MY_AI_TOOL
+	bool "My AI Tool for contest 2026 team 307"
+	default n
+	---help---
+		Enable team 307 custom AI tool application.

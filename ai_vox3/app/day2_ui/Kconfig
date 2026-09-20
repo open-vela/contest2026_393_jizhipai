@@ -1,0 +1,73 @@
+#
+# Day 2 UI Demo - Contest 2026 team 307
+#
+
+config LVX_CONTEST2026_307_DAY2_UI
+	bool "Day 2 UI demo (clock + popup + reminder)"
+	default n
+	depends on GRAPHICS_LVGL
+	depends on RTC
+	---help---
+		Day 2 UI 组件演示：时钟、弹窗、课程提醒页面。
+
+if LVX_CONTEST2026_307_DAY2_UI
+
+config LVX_CONTEST2026_307_DAY2_UI_PROGNAME
+	string "Program name"
+	default "day2_ui"
+
+config LVX_CONTEST2026_307_DAY2_UI_PRIORITY
+	int "Task priority"
+	default 100
+
+config LVX_CONTEST2026_307_DAY2_UI_STACKSIZE
+	int "Stack size"
+	default 65536
+
+endif
+
+config LVX_CONTEST2026_307_TOUCH_TEST
+	bool "Touch screen test utility"
+	default n
+	depends on INPUT_TOUCHSCREEN
+	---help---
+		触摸屏最小测试工具：读取并打印触摸坐标。
+
+if LVX_CONTEST2026_307_TOUCH_TEST
+
+config LVX_CONTEST2026_307_TOUCH_TEST_PROGNAME
+	string "Program name"
+	default "touch_test"
+
+config LVX_CONTEST2026_307_TOUCH_TEST_PRIORITY
+	int "Task priority"
+	default 100
+
+config LVX_CONTEST2026_307_TOUCH_TEST_STACKSIZE
+	int "Stack size"
+	default 4096
+
+endif
+
+config LVX_CONTEST2026_307_FONT_TEST
+	bool "Chinese font test utility"
+	default n
+	depends on GRAPHICS_LVGL
+	---help---
+		中文字体测试工具：验证 FreeType 字体加载和中文显示。
+
+if LVX_CONTEST2026_307_FONT_TEST
+
+config LVX_CONTEST2026_307_FONT_TEST_PROGNAME
+	string "Program name"
+	default "font_test"
+
+config LVX_CONTEST2026_307_FONT_TEST_PRIORITY
+	int "Task priority"
+	default 100
+
+config LVX_CONTEST2026_307_FONT_TEST_STACKSIZE
+	int "Stack size"
+	default 32768
+
+endif
