@@ -234,6 +234,9 @@ void esp32s3_dma_release(int chan)
  *
  ****************************************************************************/
 
+/* [V643] PROBE: direct ROM console, does not go through /dev/kmsg */
+extern int esp_rom_printf(const char *fmt, ...);
+
 uint32_t esp32s3_dma_setup(struct esp32s3_dmadesc_s *dmadesc, uint32_t num,
                            uint8_t *pbuf, uint32_t len, bool tx, int chan)
 {
@@ -247,8 +250,18 @@ uint32_t esp32s3_dma_setup(struct esp32s3_dmadesc_s *dmadesc, uint32_t num,
   int dma_size = ESP32S3_DMA_BUFFER_MAX_SIZE;
   bool buffer_in_psram = esp32s3_ptr_extram(pdata);
   int block_size_index = 0;
+  if (!tx)
+    {
+      
+    }
+
   uint32_t addr = GDMA_CH_REG_ADDR(DMA_IN_CONF0_CH0_REG, chan);
   bool burst_en = REG_GET_FIELD(addr, DMA_IN_DATA_BURST_EN_CH0);
+
+  if (!tx)
+    {
+      
+    }
 
   DEBUGASSERT(dmadesc != NULL);
   DEBUGASSERT(num > 0);
@@ -312,6 +325,11 @@ uint32_t esp32s3_dma_setup(struct esp32s3_dmadesc_s *dmadesc, uint32_t num,
       dmadesc[i].pbuf = pdata;
       dmadesc[i].next = &dmadesc[i + 1];
 
+      if (!tx)
+        {
+          
+        }
+
       bytes -= data_len;
       if (bytes == 0)
         {
@@ -331,6 +349,11 @@ uint32_t esp32s3_dma_setup(struct esp32s3_dmadesc_s *dmadesc, uint32_t num,
     }
 
   dmadesc[i].next  = NULL;
+
+  if (!tx)
+    {
+      
+    }
 
   return len - bytes;
 }

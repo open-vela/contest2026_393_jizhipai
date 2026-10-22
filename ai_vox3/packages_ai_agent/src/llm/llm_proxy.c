@@ -386,6 +386,13 @@ static int llm_http_direct(const char* post_data, resp_buf_t* rb,
 }
 
 /* Proxy path via CONNECT tunnel */
+/* [V795] defined at the end of this file; declared here so the call
+ * inside llm_http_via_proxy() is not an implicit non-static one. */
+static void __attribute__((noinline)) v795_report(const char *host,
+                                                unsigned long t_open_ms,
+                                                unsigned long t_read_ms,
+                                                unsigned long t_parse_ms);
+
 static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
     int* out_status)
 {
@@ -403,7 +410,11 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
     if (port <= 0)
         port = 443;
 
+    /* [V795] TCP + CONNECT + TLS handshake, every single call. */
+    struct timeval v795_t0, v795_t1, v795_t2, v795_t3;
+    gettimeofday(&v795_t0, NULL);
     proxy_conn_t* conn = proxy_conn_open(llm_host, port, 30000);
+    gettimeofday(&v795_t1, NULL);
     if (!conn)
         return ERROR;
 
@@ -436,6 +447,8 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
         llm_path, llm_host, auth_header, provider_hdr, body_len);
 
     if (proxy_conn_write(conn, header, hlen) < 0 || proxy_conn_write(conn, post_data, body_len) < 0) {
+        /* [V795] request written, response read to EOF. */
+        gettimeofday(&v795_t2, NULL);
         proxy_conn_close(conn);
         return ERROR;
     }
@@ -475,6 +488,15 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
         rb->data[rb->len] = '\0';
     }
 
+    /* [V795] header stripped; report the split. */
+    gettimeofday(&v795_t3, NULL);
+    v795_report(llm_host,
+                 (unsigned long)((v795_t1.tv_sec - v795_t0.tv_sec) * 1000 +
+                                 (v795_t1.tv_usec - v795_t0.tv_usec) / 1000),
+                 (unsigned long)((v795_t2.tv_sec - v795_t1.tv_sec) * 1000 +
+                                 (v795_t2.tv_usec - v795_t1.tv_usec) / 1000),
+                 (unsigned long)((v795_t3.tv_sec - v795_t2.tv_sec) * 1000 +
+                                 (v795_t3.tv_usec - v795_t2.tv_usec) / 1000));
     return OK;
 }
 
@@ -573,21 +595,11 @@ int llm_http_call(const char* post_data, resp_buf_t* rb,
 
         if (ret != OK)
           {
-            syslog(LOG_ERR,
-                   "[V358] [llm] FAIL host=%s:%s%s rc=%d errno=%d "
-                   "http=%d bytes=%d ms=%ld tls=%d\n",
-                   host, port, path, ret, saved_errno,
-                   (out_status != NULL) ? *out_status : -1,
-                   (int)((rb != NULL) ? rb->len : 0), ms, use_tls);
+            
           }
         else
           {
-            syslog(LOG_INFO,
-                   "[V358] [llm] OK host=%s:%s%s http=%d bytes=%d "
-                   "ms=%ld tls=%d\n",
-                   host, port, path,
-                   (out_status != NULL) ? *out_status : -1,
-                   (int)((rb != NULL) ? rb->len : 0), ms, use_tls);
+            
           }
 
         return ret;
@@ -645,9 +657,7 @@ int llm_chat(const char* system_prompt, const char* messages_json,
      * 只告警、不再直接 ERROR（否则对话永远出不来）。 */
 
     if (api_key[0] == '\0') {
-        syslog(LOG_WARNING,
-               "[V359] [%s] api_key empty (no-auth endpoint), continuing\n",
-               TAG);
+        
     }
 
     cJSON* body = cJSON_CreateObject();
@@ -703,7 +713,7 @@ int llm_chat(const char* system_prompt, const char* messages_json,
     /* [V359] 留痕：把请求体前 240 字节打出来，用来确认
      * chat_template_kwargs.enable_thinking=false 真的进了 body。 */
 
-    syslog(LOG_INFO, "[V359] [%s] body: %.*s\n", TAG, 240, post_data);
+    
 
     resp_buf_t rb = { 0 };
     int status = 0;
@@ -787,9 +797,7 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     /* [V359] 同上：空 api_key 允许继续 */
 
     if (api_key[0] == '\0') {
-        syslog(LOG_WARNING,
-               "[V359] [%s] api_key empty (no-auth endpoint), continuing\n",
-               TAG);
+        
     }
 
     cJSON* body = cJSON_CreateObject();
@@ -1013,4 +1021,20 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
         resp->tool_use ? "tool_calls" : "end_turn");
 
     return OK;
+}
+
+
+
+/* [V795] Millisecond accounting for one proxied LLM call.  Purely a
+ * measurement: it reads a struct the caller already filled in and prints.
+ */
+static void __attribute__((noinline)) v795_report(const char *host,
+                                                unsigned long t_open_ms,
+                                                unsigned long t_read_ms,
+                                                unsigned long t_parse_ms)
+{
+  syslog(LOG_INFO,
+         "[V795] llm %s open=%lu read=%lu parse=%lu total=%lu ms\n",
+         host, t_open_ms, t_read_ms, t_parse_ms,
+         t_open_ms + t_read_ms + t_parse_ms);
 }

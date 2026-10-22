@@ -456,8 +456,7 @@ int diag_report(const char *msg)
         msg, HTTP_DIAG_HOST);
 
     if (send(fd, req, (size_t)rl, 0) < 0) {
-        syslog(LOG_ERR, "[V360] [%s] EIO#1 (diag send) errno=%d req=%d\n",
-               TAG, errno, rl);
+        
         {
             static const unsigned int backs[] = { 1, 2, 5, 10, 30 };
             unsigned int idx = s_fail_streak;
@@ -584,8 +583,7 @@ static int http_tts_speak_stream_once(const char *text,
      * （本文件自己的 socket + [V323]/[V328] connect_timeout，
      * **不是** vela_http_post_json()）。 */
 
-    syslog(LOG_INFO, "[V360] [%s] ENTER stream path: http://%s:%d%s\n",
-           TAG, host, port, req_path);
+    
 
     size_t reqlen = strlen(req_path) + 256;
     req = malloc(reqlen);
@@ -721,15 +719,9 @@ static int http_tts_speak_stream_once(const char *text,
 
         if (sent < 0)
           {
-            syslog(LOG_ERR,
-                   "[V357] [%s] send FAILED errno=%d (ENOMEM=%d EAGAIN=%d) "
-                   "after %d attempts, req=%d bytes\n",
-                   TAG, last_err, ENOMEM, EAGAIN, attempt, rl);
+            
             diag_report("TTS_SEND_FAIL");
-            syslog(LOG_ERR,
-                   "[V360] [%s] EIO#2 (send) errno=%d after %d attempts "
-                   "req=%d url=%s\n",
-                   TAG, last_err, attempt, rl, s_url);
+            
             close(fd);
             free(enc);
             free(req_path);
@@ -739,10 +731,7 @@ static int http_tts_speak_stream_once(const char *text,
 
         if (attempt > 0)
           {
-            syslog(LOG_INFO,
-                   "[V357] [%s] send recovered on attempt %d "
-                   "(errno was %d), sent %d bytes\n",
-                   TAG, attempt, last_err, sent);
+            
           }
     }
 
@@ -770,10 +759,7 @@ static int http_tts_speak_stream_once(const char *text,
         if (n < 0) {
             diag_report("TTS_HDR_FAIL");
             syslog(LOG_ERR, "[%s] recv(header): %d\n", TAG, errno);
-            syslog(LOG_ERR,
-                   "[V360] [%s] EIO#3 (recv header) errno=%d retries=%d "
-                   "hdr_len=%d hdr80=%.80s\n",
-                   TAG, errno, hdr_retries, hdr_len, hdr);
+            
             close(fd);
             free(enc);
             free(req_path);
@@ -782,10 +768,7 @@ static int http_tts_speak_stream_once(const char *text,
         }
         if (n == 0) {
             syslog(LOG_ERR, "[%s] closed before full headers\n", TAG);
-            syslog(LOG_ERR,
-                   "[V360] [%s] EIO#4 (peer closed in header) retries=%d "
-                   "hdr_len=%d hdr80=%.80s\n",
-                   TAG, hdr_retries, hdr_len, hdr);
+            
             close(fd);
             free(enc);
             free(req_path);
@@ -828,18 +811,12 @@ static int http_tts_speak_stream_once(const char *text,
             /* [V360] 头拿到了：把 http 状态、头长度、Content-Length、
              * 头原文前 80 字节全部打出来。 */
 
-            syslog(LOG_INFO,
-                   "[V360] [%s] header OK http=%d hdr_len=%d "
-                   "content_length=%ld hdr80=%.80s\n",
-                   TAG, status, hdr_len, v360_content_length(hdr), hdr);
+            
         }
 
         if (hdr_len >= (int)sizeof(hdr) - 1) {
             syslog(LOG_ERR, "[%s] header section too large\n", TAG);
-            syslog(LOG_ERR,
-                   "[V360] [%s] EIO#5 (header too large) hdr_len=%d "
-                   "hdr80=%.80s\n",
-                   TAG, hdr_len, hdr);
+            
             close(fd);
             free(enc);
             free(req_path);
@@ -882,10 +859,7 @@ static int http_tts_speak_stream_once(const char *text,
         if (n < 0) {
             diag_report("TTS_BODY_FAIL");
             syslog(LOG_ERR, "[%s] recv(body): %d\n", TAG, errno);
-            syslog(LOG_ERR,
-                   "[V360] [%s] EIO#6 (recv body) errno=%d body_bytes=%d "
-                   "idle=%d\n",
-                   TAG, errno, body_bytes, body_idle);
+            
             close(fd);
             free(enc);
             free(req_path);
@@ -909,8 +883,7 @@ static int http_tts_speak_stream_once(const char *text,
     }
 
     /* [V357] The "TTS audio bytes" ring: one verifiable line per call. */
-    syslog(LOG_INFO, "[V357] [%s] tts body = %d bytes\n",
-           TAG, body_bytes);
+    
 
     if (body_bytes == 0) {
         diag_report("TTS_BODY_EMPTY");
@@ -944,18 +917,12 @@ int http_tts_speak_stream(const char *text,
                 {
                     if (attempt > 1)
                         {
-                            syslog(LOG_ERR,
-                                   "[V361] [%s] TTS recovered on attempt "
-                                   "%d/%d\n", TAG, attempt,
-                                   HTTP_TTS_MAX_ATTEMPTS);
+                            
                         }
                     break;
                 }
 
-            syslog(LOG_ERR,
-                   "[V361] [%s] TTS attempt %d/%d failed ret=%d bytes=%d\n",
-                   TAG, attempt, HTTP_TTS_MAX_ATTEMPTS, ret,
-                   s_last_stream_bytes);
+            
 
             /* 已经吐出去音频了：再试会重复播放，直接放弃。 */
             if (s_last_stream_bytes > 0)

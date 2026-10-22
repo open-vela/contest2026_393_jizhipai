@@ -23,6 +23,11 @@
  ****************************************************************************/
 
 #include <nuttx/config.h>
+
+/* [V644] PROBE: direct ROM console -- does NOT go through the
+ * /dev/kmsg ring buffer, so it survives a panic dump.  Declared
+ * here because this file uses it before the old [V644] block. */
+extern int esp_rom_printf(const char *fmt, ...);
 #include <syslog.h>
 
 #ifdef CONFIG_ESP32S3_I2S
@@ -69,6 +74,32 @@
 #include "hardware/esp32s3_iomux.h"
 #include "hardware/esp32s3_pinmap.h"
 #include "hardware/esp32s3_dma.h"
+
+/* [V1024] Probe gate.
+ *
+ * This build carries ~60 probe lines/s during a reply, and a few
+ * of them ([V810], [V1012]) dump raw PCM straight at the console.
+ * Console throughput here is ~4300 chars/s with an 8 KB ring, so a
+ * printf blocks hard once it fills.  At 60 lines/s the audio thread
+ * spends most of its budget inside printf, which is itself a source
+ * of the stutter we are trying to measure.
+ *
+ * g_v1024_quiet == 1 suppresses every [Vnnn] printf except the
+ * handful of load-bearing ones (see KEEP in the patch script).
+ * Flip it to 0 at runtime from NSH to bring them all back.
+ */
+#ifdef __cplusplus
+extern "C" int g_v1024_quiet;
+#else
+extern int g_v1024_quiet;
+#endif
+
+#ifndef V1024_QUIET
+#define V1024_QUIET 1
+#endif
+#define V1024P(...) do { if (V1024_QUIET == 0) printf(__VA_ARGS__); } while (0)
+#define V1024S(lvl, ...) do { if (V1024_QUIET == 0) syslog(lvl, __VA_ARGS__); } while (0)
+
 
 /* The TX FIFO is the first register of the block. */
 #define I2S_TX_FIFO_REG(i)   (REG_I2S_BASE(i) + 0x00)
@@ -153,12 +184,64 @@ static int               g_tx_cfg_done;   /* [V346] V264 sequence ran once    */
 volatile unsigned int g_v94_recv;      /* i2s_receive() calls            */
 volatile int          g_v94_setupret;  /* i2s_rxdma_setup() last return  */
 volatile unsigned int g_v94_start;     /* i2s_rxdma_start() calls        */
+static unsigned     g_v905_eof = 2047u; /* [V905] RX EOF threshold: 2048 B block */
 volatile unsigned int g_v94_isr;       /* rx interrupt entries           */
 volatile unsigned int g_v94_eof;       /* rx end-of-frame interrupts     */
 volatile unsigned int g_v94_pb;        /* es8311_processbegin() calls    */
 volatile int          g_v94_i2sret;    /* last I2S_RECEIVE return        */
 volatile unsigned int g_v94_done;      /* es8311_processdone() calls     */
 volatile int          g_v94_rxonly;    /* current direction override     */
+
+/* [V733] How many bits the RX stream is currently shifted left, measured
+ * from the whole-buffer OR (see the [V733] block in the RX DMA callback).
+ * 0 = aligned.  Samples are shifted right by this much before delivery. */
+
+static int g_v733_shift;
+
+/* [V911] Per-boot logical right shift of the delivered RX stream.
+ *
+ * V910 measured it on four boots of ONE firmware: the [V907] pk medians
+ * were 0xFFFE / 0x0FFF / 0xFFFC / 0x3FFF, and 0xFFFF >> k for
+ * k = 0 / 4 / 0 / 2 reproduces that set exactly.  V911 run1 added a
+ * fifth: pk median 0x003F = 0xFFFE >> 10, i.e. k = 10.  The receiver
+ * latches the frame k bits early, so every delivered word is the true
+ * sample shifted LOGICALLY right by k -- bit 15 goes with it, which is
+ * why the application's negative-sample ratio collapses on the shifted
+ * boots.
+ *
+ * g_v911_hsb is the histogram of the highest set bit of each buffer's
+ * own OR; g_v911_k is 15 minus the mode of that histogram, taken over
+ * the first V911_LOCK_BLOCKS buffers and then frozen.  The mode, not a
+ * single accumulated OR, because roughly nine buffers at the start of
+ * every boot carry a transient (or = 0xf000 / 0xfe00 / 0x00ff) that
+ * lights bit 15 and would otherwise pin k at 0 forever. */
+
+#define V911_LOCK_BLOCKS 48u
+
+/* [V913] Buffers discarded before the k histogram starts counting.
+ *
+ * V912 run3 locked k = 9 from hsb = 0 0 0 0 0 0 34 0 0 0 0 0 0 0 0 14:
+ * 34 buffers with the startup transient (hsb 6) outvoted 14 buffers
+ * of real audio (hsb 15), so the mode named the transient and k was
+ * estimated 6 bits off.  The comment above already says "roughly
+ * nine buffers at the start of every boot carry a transient", and
+ * V912 shows the number can be far larger than nine.
+ *
+ * 16 is the smallest round number that clears the transient on all
+ * three V912 runs while leaving 32 real buffers to vote -- a 2:1
+ * majority instead of 14:34.  The window still closes at
+ * V911_LOCK_BLOCKS so the lock instant does not move. */
+#define V913_SKIP_BLOCKS 16u
+
+static unsigned g_v911_hsb[16];
+static unsigned g_v911_blocks;
+static unsigned g_v911_k;
+static int      g_v911_locked;
+
+/* [V690] Last i2s_receive() instance, so esp32s3_i2s_rx_health() (a plain
+ * void entry point called from the capture thread) can report the queue
+ * depths.  Single I2S port on this board, so a file-scope pointer is fine. */
+static struct esp32s3_i2s_s *g_v690_priv;
 
 
 /****************************************************************************
@@ -177,7 +260,74 @@ volatile int          g_v94_rxonly;    /* current direction override     */
  * NuttX hard-codes CLK160 (2 * APB) and never checks that the source is
  * actually running.  Make it switchable so we can fall back to XTAL when the
  * I2S clock domain turns out to be dead. */
-static uint32_t g_i2s_sclk = (2 * APB_CLK_FREQ);
+/* [V670] *** The I2S divider base on THIS board. ***
+ *
+ * The bring-up asked for I2S_PLL_F160M_CLK and told the divider maths that the
+ * source runs at 160 MHz (2 * APB_CLK_FREQ).  Two independent measurements say
+ * it actually runs at 150 MHz:
+ *
+ *   1. Pads, 50 ms CCOUNT-bounded windows, reproducible:
+ *        BCLK = 470376 Hz / 490679 Hz  ->  MCLK = BCLK * 8 = 3.76-3.92 MHz
+ *        MCLK = sclk / (39 + 1/16)     ->  sclk = 147-153 MHz
+ *      Both figures read 6% below the 512 kHz / 4.096 MHz the registers claim.
+ *
+ *   2. Playback accounting: 31232 samples consumed over 500440024 CPU cycles
+ *      = 16022 cycles per sample.  CCOUNT runs at 240 MHz and one sample is
+ *      one LRCK frame, so the real frame rate is 240e6 / 16022 = 14979 Hz.
+ *
+ * 15000 / 16000 is exactly 15/16, i.e. exactly 150 MHz against 160 MHz.
+ *
+ * Effect of the old assumption: with mclk_div latched at 39 + 1/16 the real
+ * MCLK came out at 3.84 MHz instead of 4.096 MHz, so BCLK was 480 kHz instead
+ * of 512 kHz and the frame rate 15000 Hz instead of 16000 Hz -- playback ran
+ * 6.25% slow, roughly a semitone flat. */
+#define I2S_PLL_F160M_HZ   150000000u
+
+static uint32_t g_i2s_sclk = I2S_PLL_F160M_HZ;
+
+/* [V668] Desired TX channel mode, remembered by i2s_txchannels() so that
+ * i2s_txdma_start() can re-latch it inside its TX-stop window.  Kept next to
+ * the clock globals because it has exactly the same lifetime: it describes
+ * how the transmitter must be programmed, independent of which of the
+ * several reset sites in this file happens to run next. */
+static int g_i2s_tx_mono;
+static int g_i2s_rx_mono;       /* [V681] RX mirror of g_i2s_tx_mono */
+
+/* [V682] Which RX TDM slots are armed: 0x01 = slot 0 (mono, default),
+ * 0x02 = slot 1, 0x03 = both.  Refreshed from /tmp/rxslot.txt on every
+ * capture start, so the candidates can be swept without a reflash. */
+static uint32_t g_i2s_rx_slot_mask = I2S_RX_TDM_PDM_CHAN0_EN;
+
+/* [V671] *** Light re-arm latch. ***
+ *
+ * i2s_txdma_start() runs on EVERY buffer and used to re-run the whole
+ * V343/V348 configure-reset-start block each time, I2S_TX_RESET and
+ * I2S_TX_FIFO_RESET included.  The FIFO reset throws away the ~64 samples
+ * (about 4 ms at 16 kHz) that are still buffered in it, so every 2048-byte
+ * chunk of TTS audio arrived with a hole in front of it -- roughly thirty
+ * dropouts over a two second sentence.  That is the reported stutter.
+ *
+ * V348 made the block unconditional because, at the time, skipping it left
+ * the transmitter idle (STATE=TX_IDLE, outlink parked, OWNER stuck) and the
+ * transfer never completed.  That was measured with the TDM channel enable
+ * bug and the wrong divider base still in place, i.e. before v669/v670.  Now
+ * that CONF, TDM and the clock are right, a transfer that finds the module
+ * already configured only needs its descriptor handed to the GDMA.
+ *
+ * g_v671_cfg_valid is 1 once the module has been fully configured and the
+ * transmitter is running.  Every site that pulses I2S_TX_RESET clears it
+ * again, so the next transfer reconfigures from scratch: i2s_configure(),
+ * i2s_clock_try_source(), i2s_tx_channel_start() and i2s_tx_channel_stop().
+ * audio_playback_open() goes through i2s_txsamplerate() ->
+ * i2s_clock_try_source() on every speak, so the first transfer of each
+ * utterance is always a full configure and the rest are light re-arms.
+ *
+ * If the light path ever turns out to be unsafe it announces itself loudly:
+ * the TX never drains, so audio_playback.c reports
+ * "I2S TX completion TIMEOUT after 1.5 s" and there is no sound at all. */
+static int g_v671_cfg_valid;
+static int g_v671_full_n;
+static int g_v671_light_n;
 static int      g_sclk_fallback;      /* 1 once we switched to XTAL  */
 static int      g_tx_update_spins;    /* spins waiting for tx_update */
 static int      g_tx_update_spins2;   /* same, after the fallback    */
@@ -529,7 +679,17 @@ struct esp32s3_i2s_s
  * (2 buffers armed)"), so 4 still leaves 2 spare, and the 4096 bytes freed
  * here pay for the enlarged es8311 worker stacks (2 x 2048).  Raising this
  * to 6 is still not an option: it overflows dram0_0_seg by 3056 bytes. */
-#define I2S_DMABUF_SLOTS     2
+/* [V638] 2 -> 4.  The V317/V372/V377 notes above all describe 4 (or 6)
+ * slots, but the literal had been left at 2 -- which is exactly the case
+ * those notes call out as broken: audio_capture_native arms 2 RX buffers,
+ * so a 2-slot pool is fully consumed the moment recording starts and the
+ * TX / internal-loopback leg of the same codec gets nothing.  That is the
+ * state in which the es8311 worker died with
+ *   xtensa_user_panic: User Exception: EXCCAUSE=001c task: es8311
+ * 4 slots leaves 2 spare.  V377 measured 6 as overflowing dram0_0_seg by
+ * 3056 bytes; since then RAMLOG (-24 KB), IOB (-83 KB) and the TLS scratch
+ * buffer (-4 KB) were all trimmed, so 4 is comfortably affordable. */
+#define I2S_DMABUF_SLOTS     4
 #define I2S_DMABUF_SLOT_SZ   4096
 
 static uint8_t g_i2s_dmabuf[I2S_DMABUF_SLOTS][I2S_DMABUF_SLOT_SZ]
@@ -611,6 +771,21 @@ static void     i2s_tx_irq_unmask(struct esp32s3_i2s_s *priv);
 static IRAM_ATTR int  i2s_rxdma_setup(struct esp32s3_i2s_s *priv,
                                       struct esp32s3_buffer_s *bfcontainer);
 static void           i2s_rx_worker(void *arg);
+
+/* [V691] Defined far below: the RX worker calls it once the stream is
+ * actually running, which is the only moment the measurement means
+ * anything (see patch_v691.py). */
+
+void esp32s3_i2s_rx_health(void);
+
+/* [V858] Defined far below (right after esp32s3_i2s_set_rxonly()) and
+ * called from the three upper-half files, so they need prototypes. */
+
+void     esp32s3_i2s_v858_capture_begin(void);
+void     esp32s3_i2s_v858_after_playback(void);
+void     esp32s3_i2s_v858_heal(void);
+void     esp32s3_i2s_v858_relock_current(void);
+uint32_t esp32s3_i2s_v858_rxconf(void);
 static void           i2s_rx_schedule(struct esp32s3_i2s_s *priv,
                                       struct esp32s3_dmadesc_s *outlink);
 #endif /* I2S_HAVE_RX */
@@ -727,6 +902,8 @@ static int i2s_clock_try_source(struct esp32s3_i2s_s *priv, uint32_t sel,
   modifyreg32(I2S_TX_CONF_REG(port), 0, I2S_TX_FIFO_RESET);
   modifyreg32(I2S_TX_CONF_REG(port), I2S_TX_FIFO_RESET, 0);
 
+  g_v671_cfg_valid = 0;   /* [V671] the reset above dropped the module state */
+
   /* TX must take its own BCK/WS, never the RX side's (see V250). */
 
   modifyreg32(I2S_TX_CONF_REG(port), I2S_SIG_LOOPBACK, 0);
@@ -762,19 +939,15 @@ static uint32_t i2s_clock_source_bringup(struct esp32s3_i2s_s *priv)
   int spins;
   uint32_t rate = 0;
 
-  /* Attempt 1: PLL_F160M (160 MHz) -- the hardware default. */
+  /* Attempt 1: PLL_F160M -- the hardware default.  The divider base is the
+   * measured 150 MHz, not the 160 MHz the pin is named after (see
+   * I2S_PLL_F160M_HZ above). */
 
-  spins = i2s_clock_try_source(priv, I2S_PLL_F160M_CLK, 160000000u, &rate);
+  spins = i2s_clock_try_source(priv, I2S_PLL_F160M_CLK, I2S_PLL_F160M_HZ,
+                               &rate);
   g_tx_update_spins = spins;
 
-  syslog(LOG_INFO,
-         "[V341] clk try#1 src=PLL_F160M(160MHz) sel=%u alive=%d spins=%d "
-         "CLKM=0x%08x DIV=0x%08x CONF1=0x%08x rate=%u\n",
-         (unsigned)I2S_PLL_F160M_CLK, (spins < I2S_UPDATE_SPIN_MAX), spins,
-         (unsigned)getreg32(I2S_TX_CLKM_CONF_REG(port)),
-         (unsigned)getreg32(I2S_TX_CLKM_DIV_CONF_REG(port)),
-         (unsigned)getreg32(I2S_TX_CONF1_REG(port)),
-         (unsigned)rate);
+  
 
   if (spins < I2S_UPDATE_SPIN_MAX)
     {
@@ -787,14 +960,7 @@ static uint32_t i2s_clock_source_bringup(struct esp32s3_i2s_s *priv)
   spins = i2s_clock_try_source(priv, I2S_XTAL_CLK, 40000000u, &rate);
   g_tx_update_spins2 = spins;
 
-  syslog(LOG_WARNING,
-         "[V341] clk try#2 src=XTAL(40MHz) sel=%u alive=%d spins=%d "
-         "CLKM=0x%08x DIV=0x%08x CONF1=0x%08x rate=%u\n",
-         (unsigned)I2S_XTAL_CLK, (spins < I2S_UPDATE_SPIN_MAX), spins,
-         (unsigned)getreg32(I2S_TX_CLKM_CONF_REG(port)),
-         (unsigned)getreg32(I2S_TX_CLKM_DIV_CONF_REG(port)),
-         (unsigned)getreg32(I2S_TX_CONF1_REG(port)),
-         (unsigned)rate);
+  
 
   g_i2s_clk_sel = I2S_XTAL_CLK;
 
@@ -804,9 +970,7 @@ static uint32_t i2s_clock_source_bringup(struct esp32s3_i2s_s *priv)
        * source clock.  Leave the (always-running) crystal selected so the
        * system is deterministic, and say so loudly. */
 
-      syslog(LOG_ERR,
-             "[V341] NEITHER source advanced the TX clock domain -- the TX "
-             "domain is stalled for a reason other than the source clock\n");
+      
     }
 
   return rate;
@@ -822,6 +986,11 @@ static int      i2s_send(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
 #ifdef I2S_HAVE_RX
 static void     i2s_rx_channel_start(struct esp32s3_i2s_s *priv);
 static void     i2s_rx_channel_stop(struct esp32s3_i2s_s *priv);
+static int      i2s_rx_release_inflight(struct esp32s3_i2s_s *priv);
+#ifdef I2S_HAVE_TX
+static int      i2s_tx_release_inflight(struct esp32s3_i2s_s *priv);
+void            esp32s3_i2s_tx_flush(void);
+#endif /* I2S_HAVE_TX */
 static int      i2s_rxchannels(struct i2s_dev_s *dev, uint8_t channels);
 static uint32_t i2s_rxsamplerate(struct i2s_dev_s *dev, uint32_t rate);
 static uint32_t i2s_rxdatawidth(struct i2s_dev_s *dev, int bits);
@@ -1017,12 +1186,45 @@ static struct esp32s3_buffer_s *i2s_buf_allocate(struct esp32s3_i2s_s *priv)
 
   flags = spin_lock_irqsave(&priv->slock);
   bfcontainer = priv->bf_freelist;
+
+  /* [V723] The free list can legitimately be empty, and walking off a
+   * NULL head here is exactly how the board died in the field.
+   *
+   * _v722_boot.log, t = 46.72:
+   *
+   *   [V646] UP cause=001c (LoadProhibited) vaddr=00000000
+   *          pc=421f3302 -> i2s_buf_allocate
+   *          a0=421f3d66 -> i2s_receive
+   *          task es8311_workerthread
+   *
+   * Ten "[audio_direct] I2S TX completion TIMEOUT" lines came first:
+   * the v711 timeout handling isolates a buffer rather than returning
+   * it to the pool, internal DRAM is tight on this board ([V633]
+   * intram_max has measured down to 2048), and the pool drains.
+   *
+   * The header above already promises "NULL if there are no available
+   * buffer containers", and both callers check for NULL and report
+   * -ENOMEM -- but DEBUGASSERT compiles out of release builds, so an
+   * empty list went straight into bfcontainer->flink.
+   *
+   * Repairing the TX drain is a separate job.  This makes exhaustion
+   * survivable: return NULL and give the semaphore count back, so the
+   * pool can recover instead of deadlocking the next caller. */
+
+  if (bfcontainer == NULL)
+    {
+      spin_unlock_irqrestore(&priv->slock, flags);
+      nxsem_post(&priv->bufsem);
+      return NULL;
+    }
+
   DEBUGASSERT(bfcontainer);
 
   /* Unlink the buffer from the freelist */
 
   priv->bf_freelist = bfcontainer->flink;
   spin_unlock_irqrestore(&priv->slock, flags);
+  
   return bfcontainer;
 }
 
@@ -1181,10 +1383,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
        */
       if (g_tx_rate_bail_pend <= 5)
         {
-          syslog(LOG_INFO,
-                 "[V362] IDLE txdma_start pend-empty #%d site=%d "
-                 "(1=i2s_txdma_setup 2=i2s_tx_schedule/ISR)\n",
-                 g_tx_rate_bail_pend, g_tx_callsite);
+          
         }
 
       /* [V364] Both queues are empty: nothing is in flight and nothing is
@@ -1212,20 +1411,14 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
   i2s_apply_tx_gdma_strategy(priv);
 
   struct esp32s3_buffer_s *bfcontainer;
+  int light;                       /* [V671] 1 = DMA re-arm only */
 
   /* [V347] Prologue probe: answer team-lead's question "does the 2nd transfer
    * reach the I2S_TX_START write at all, or is it swallowed by an early
    * return?".  Log once per transfer what state we enter with. */
 
   g_tx_txdma_start_n++;
-  syslog(LOG_INFO,
-         "[V347] txdma_start #%d: tx_started=%d act_empty=%d pend_empty=%d "
-         "cfg_done=%d STATE=0x%08x TXCONF=0x%08x\n",
-         g_tx_txdma_start_n, (int)priv->tx_started,
-         (int)sq_empty(&priv->tx.act), (int)sq_empty(&priv->tx.pend),
-         g_tx_cfg_done,
-         (unsigned)getreg32(I2S_STATE_REG(priv->config->port)),
-         (unsigned)getreg32(I2S_TX_CONF_REG(priv->config->port)));
+  
 
   /* If there is already an active transmission in progress, then bail
    * returning success.
@@ -1234,8 +1427,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
   if (!sq_empty(&priv->tx.act))
     {
       g_tx_txdma_bail_act++;
-      syslog(LOG_INFO, "[V347] txdma_start BAIL: tx.act non-empty (n=%d)\n",
-             g_tx_txdma_bail_act);
+      
       return OK;
     }
 
@@ -1244,9 +1436,61 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
   if (sq_empty(&priv->tx.pend))
     {
       g_tx_txdma_bail_pend++;
-      syslog(LOG_INFO, "[V347] txdma_start BAIL: tx.pend empty (n=%d)\n",
-             g_tx_txdma_bail_pend);
+      
       return OK;
+    }
+
+  /* [V671] *** Which path does this transfer take? ***
+   *
+   * light == 1 means the module is configured and the transmitter is already
+   * running, so all this transfer needs is a descriptor for the GDMA.  That
+   * is what upstream NuttX does, and it is the only way to keep the TX FIFO
+   * from being flushed between two 2048-byte chunks (see g_v671_cfg_valid).
+   *
+   * light == 0 means a reset path ran since the last transfer, so re-run the
+   * full configure/reset/start sequence exactly as before. */
+
+  light = (g_v671_cfg_valid != 0 &&
+           (getreg32(I2S_TX_CONF_REG(priv->config->port)) & I2S_TX_START) != 0);
+
+  if (light)
+    {
+      g_v671_light_n++;
+    }
+  else
+    {
+      g_v671_full_n++;
+    }
+
+  /* [V1019] *** Which path did that transfer take? ***
+   *
+   * light == 1 is the cheap re-arm: the transmitter is already
+   * running, so the transfer only needs a GDMA descriptor, and the
+   * TX FIFO survives the boundary.  light == 0 runs the full
+   * configure / I2S_TX_RESET / stop / start block, and the V671
+   * comment says the light path is the only thing that keeps the
+   * FIFO from being flushed between two chunks.
+   *
+   * If the full path wins on every buffer the FIFO is flushed once
+   * per 4096-byte buffer, i.e. once per 64 ms at 16 kHz.  Nothing
+   * upstream of write() can see that, which is why every upstream
+   * measurement reads clean while the speaker crackles.
+   *
+   * light is gated on I2S_TX_CONF.START being set, so it falls back
+   * to the full path whenever that bit reads 0.  Printed every 8th
+   * transfer because the console cannot carry one line per buffer.
+   * Take differences between lines; these are running totals. */
+  if (((g_v671_light_n + g_v671_full_n) % 8) == 0)
+    {
+      uint32_t v1019_conf = getreg32(I2S_TX_CONF_REG(priv->config->port));
+
+      V1024P("[V1019]] txn full=%d light=%d START=%u MONO=%u EQ=%u "
+             "conf=0x%08x\n",
+             g_v671_full_n, g_v671_light_n,
+             (unsigned)((v1019_conf & I2S_TX_START) ? 1U : 0U),
+             (unsigned)((v1019_conf & I2S_TX_MONO_M) ? 1U : 0U),
+             (unsigned)((v1019_conf & I2S_TX_CHAN_EQUAL_M) ? 1U : 0U),
+             (unsigned)v1019_conf);
     }
 
   /* Start transmission if no data is already being transmitted */
@@ -1279,7 +1523,8 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
    * latch it -- but do it here, ahead of the reset, and only when it is
    * actually asserted so the very first transfer is untouched. */
 
-  if (getreg32(I2S_TX_CONF_REG(priv->config->port)) & I2S_TX_START)
+  if (!light &&
+      (getreg32(I2S_TX_CONF_REG(priv->config->port)) & I2S_TX_START))
     {
       int pspins = 0;
 
@@ -1291,11 +1536,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
           pspins++;
         }
 
-      syslog(LOG_INFO,
-             "[V349] pre-reset stop: spins=%d STATE=0x%08x TXCONF=0x%08x\n",
-             pspins,
-             (unsigned)getreg32(I2S_STATE_REG(priv->config->port)),
-             (unsigned)getreg32(I2S_TX_CONF_REG(priv->config->port)));
+      
     }
 
   /* [V264] *** One block, in ESP-IDF's order: configure, LATCH, then start ***
@@ -1355,6 +1596,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
    * the TX core actually run.  So make every transfer look exactly like the
    * first, known-good one. */
 
+  if (!light)
   {
     uint32_t port = priv->config->port;
     uint32_t ch   = priv->dma_channel;
@@ -1378,7 +1620,47 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
                 I2S_TX_LEFT_ALIGN_M | I2S_TX_STOP_EN_M,
                 0);
 
-    putreg32(0x00010003u, I2S_TX_TDM_CTRL_REG(port));
+    /* [V669] *** THE 2x-FAST BUG. ***
+     *
+     * This used to be a hard-coded
+     *
+     *     putreg32(0x00010003u, I2S_TX_TDM_CTRL_REG(port));
+     *
+     * i.e. TOT_CHAN_NUM = 1 (two slots per frame) with BOTH CHAN0_EN (bit 0)
+     * and CHAN1_EN (bit 1) set.  Two enabled channels means the transmitter
+     * pulls TWO samples out of the FIFO per LRCK period.  The mono PCM MiMo
+     * synthesises is then played at exactly double rate -- pitch up an
+     * octave, unintelligibly fast speech, the reported symptom.
+     *
+     * i2s_txchannels(1) already programs the right value for this board
+     * (TOT_CHAN_NUM = 1 + CHAN0_EN only, measured as tdm = 0x00010001) but
+     * this write, which runs on EVERY buffer, overrode it again.  That is
+     * also why chasing MONO / CHAN_EQUAL went nowhere: those two bits only
+     * control what is *transmitted* (duplicating the left sample onto the
+     * right slot), never how many samples a frame consumes.  Latched into the
+     * TX domain with the transmitter stopped (v668), the read-back was a
+     * clean "mono_bit=1 eq_bit=1" and the rate did not move: 28 ksample/s
+     * against an LRCK of 15109 Hz, i.e. still two samples per frame.
+     *
+     * Keep the two-slot frame structure (TOT_CHAN_NUM = 1) so BCLK stays at
+     * 32 bits per frame and the ES8311 needs no change; just stop feeding the
+     * right-hand slot out of the FIFO unless stereo is actually wanted.
+     *
+     * Same provenance as the I2S_TX_PCM2PDM_CONF_REG write below: 0x004aa004
+     * is a value measured on the struggling image, kept as-is. */
+
+    {
+      uint32_t tdm = FIELD_TO_VALUE(I2S_TX_TDM_TOT_CHAN_NUM, 1) |
+                     I2S_TX_TDM_CHAN0_EN;
+
+      if (!g_i2s_tx_mono)
+        {
+          tdm |= I2S_TX_TDM_CHAN1_EN;
+        }
+
+      putreg32(tdm, I2S_TX_TDM_CTRL_REG(port));
+
+    }
     putreg32(0x004aa004u, I2S_TX_PCM2PDM_CONF_REG(port));
 
     /* [V341] The clock divider is no longer hard-coded.  The old value
@@ -1460,14 +1742,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
         g_txclk_conf1 = getreg32(I2S_TX_CONF1_REG(port));
         g_txclk_valid = 1;
 
-        syslog(LOG_INFO,
-               "[V362] tx clock DERIVED rate=%u width=%u slot=%u "
-               "mclk=%u sclk=%u CLKM=0x%08x DIV=0x%08x\n",
-               (unsigned)priv->rate,
-               (unsigned)priv->data_width,
-               (unsigned)priv->config->total_slot,
-               (unsigned)priv->mclk_freq, (unsigned)g_i2s_sclk,
-               (unsigned)g_txclk_clkm, (unsigned)g_txclk_div);
+        
       }
     else
       {
@@ -1485,23 +1760,9 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
         sp++;
       }
 
-    syslog(LOG_INFO,
-           "[V264] latched upd=%d TXCONF=0x%08x TDM=0x%08x P2P=0x%08x "
-           "OUT0=0x%08x PD=0x%08x STATE=0x%08x\n",
-           sp,
-           (unsigned)getreg32(I2S_TX_CONF_REG(port)),
-           (unsigned)getreg32(I2S_TX_TDM_CTRL_REG(port)),
-           (unsigned)getreg32(I2S_TX_PCM2PDM_CONF_REG(port)),
-           (unsigned)GET_GDMA_CH_REG(DMA_OUT_CONF0_CH0_REG, ch),
-           (unsigned)getreg32(DMA_PD_CONF_REG),
-           (unsigned)getreg32(I2S_STATE_REG(port)));
+    
 
-    syslog(LOG_INFO,
-           "[V341] src=%u sclk=%u CLKM=0x%08x DIV=0x%08x CONF1=0x%08x\n",
-           (unsigned)g_i2s_clk_sel, (unsigned)g_i2s_sclk,
-           (unsigned)getreg32(I2S_TX_CLKM_CONF_REG(port)),
-           (unsigned)getreg32(I2S_TX_CLKM_DIV_CONF_REG(port)),
-           (unsigned)getreg32(I2S_TX_CONF1_REG(port)));
+    
 
     /* [V265] tx_start deliberately NOT written here.  The original driver
      * armed the GDMA first and started the I2S last, and that ordering has
@@ -1535,10 +1796,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
           volatile struct esp32s3_dmadesc_s *d =
             (volatile struct esp32s3_dmadesc_s *)&bfcontainer->dma_link[di];
 
-          syslog(LOG_INFO,
-                 "[V352] txdma#%d desc%d pre-arm dw0=0x%08x buf=%p next=%p\n",
-                 g_tx_txdma_start_n, di, (unsigned)d->ctrl,
-                 (void *)d->pbuf, (void *)d->next);
+          
         }
     }
 
@@ -1575,9 +1833,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
           up_clean_dcache(bstart, bend);
         }
 
-      syslog(LOG_INFO,
-             "[V354] cache clean desc[%p..%p] buf[%p..%p]\n",
-             (void *)dstart, (void *)dend, (void *)bstart, (void *)bend);
+      
     }
 
   /* [V356] *** Queue the transfer as ACTIVE before it is armed. ***
@@ -1635,6 +1891,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
    * work.  The I2S_TX_FIFO_REG(i) = base + 0x00 macro above therefore does not
    * map to anything real and must not be used. */
 
+  if (!light)
   {
     uint32_t port = priv->config->port;
     int      stop_spins = 0;
@@ -1653,6 +1910,67 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
         stop_spins++;
       }
 
+    /* [V668] *** Latch the channel mode while the transmitter is STOPPED. ***
+     *
+     * (Lines immediately above wrote TX_START = 0 and pushed a TX_UPDATE
+     * through; TX_START is only driven high again a few lines below, and the
+     * comment there says outright that no further update is issued after
+     * that write.)
+     *
+     * Why this is the right moment.  TX_CONF is shadowed into the TX clock
+     * domain and only takes effect when an update is handed over while
+     * tx_start is low.  Everything the caller-side workaround (v664/v665/v666)
+     * did wrote MONO / CHAN_EQUAL while the transmitter was already running,
+     * so the APB copy read back correct -- "[V666] forced mono:
+     * conf=0x00081264 mono=1 eq=1" -- while the datapath kept clocking at
+     * 26104 samples/s instead of 16000 (measured, v667).
+     *
+     * What is being restored.  The V343 block earlier in this function clears
+     * I2S_TX_MONO | I2S_TX_CHAN_EQUAL | I2S_TX_LEFT_ALIGN on every single
+     * buffer, and the I2S_TX_RESET after it clears them again.  That block
+     * exists to make a transmitter that used to deadlock actually run, and it
+     * works -- but it leaves the transmitter in stereo mode permanently.
+     *
+     * Consequence of stereo mode: I2S_TX_TDM_TOT_CHAN_NUM is 1 here (bit field
+     * [19:16]; measured tdm = 0x00010001, i.e. two slots with CHAN0 enabled),
+     * so a frame carries two 16-bit slots and, with MONO / CHAN_EQUAL clear,
+     * the transmitter lifts TWO samples out of the FIFO per LRCK period.  The
+     * mono PCM that MiMo synthesises is then played at double rate: pitch up
+     * an octave, unintelligibly fast speech -- the reported symptom.  Every
+     * measurement agrees: registers all correct (MCLK 4.096 MHz, BCK_DIV 7 ->
+     * BCLK 512 kHz, BITS_MOD 15 -> 16 bits/slot, BCLK/LRCK = 32) yet the clip
+     * finishes early.
+     *
+     * I2S_TX_LEFT_ALIGN rides along because i2s_configure() sets it for
+     * I2S_TDM_PHILIPS (V236) and this reset drops it too. */
+
+    {
+      uint32_t mode = 0;
+      int      latch_spins = 0;
+
+      if (g_i2s_tx_mono)
+        {
+          mode |= I2S_TX_MONO | I2S_TX_CHAN_EQUAL;
+        }
+
+      if (priv->config->audio_std_mode == I2S_TDM_PHILIPS)
+        {
+          mode |= I2S_TX_LEFT_ALIGN;
+        }
+
+      modifyreg32(I2S_TX_CONF_REG(port),
+                  I2S_TX_MONO_M | I2S_TX_CHAN_EQUAL_M | I2S_TX_LEFT_ALIGN_M,
+                  mode);
+
+      modifyreg32(I2S_TX_CONF_REG(port), 0, I2S_TX_UPDATE);
+      while (latch_spins < I2S_UPDATE_SPIN_MAX &&
+             (getreg32(I2S_TX_CONF_REG(port)) & I2S_TX_UPDATE))
+        {
+          latch_spins++;
+        }
+
+    }
+
     g_tx_stop_spins = stop_spins;
     g_tx_state_post = getreg32(I2S_STATE_REG(port));
 
@@ -1661,6 +1979,12 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
 
     modifyreg32(I2S_TX_CONF_REG(port), 0, I2S_TX_START);
   }
+
+  /* [V671] The module is configured and the transmitter is running, so from
+   * the next transfer on the light re-arm path is allowed.  Reached from both
+   * paths (the light one skips the block above and lands here unchanged). */
+
+  g_v671_cfg_valid = 1;
 
   /* [V353] Read I2S_STATE three times straight after the start write.  The
    * previous builds could only infer the "STATE 0 -> 1 one instruction later"
@@ -1672,12 +1996,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
     uint32_t s1 = getreg32(I2S_STATE_REG(priv->config->port));
     uint32_t s2 = getreg32(I2S_STATE_REG(priv->config->port));
 
-    syslog(LOG_INFO,
-           "[V353] state after start: %08x %08x %08x "
-           "stop_spins=%d pre=0x%08x TXCONF=0x%08x\n",
-           (unsigned)s0, (unsigned)s1, (unsigned)s2,
-           g_tx_stop_spins, (unsigned)g_tx_state_pre,
-           (unsigned)getreg32(I2S_TX_CONF_REG(priv->config->port)));
+    
   }
 
   /* [V347] Post-start verify: the whole point of this version is that this
@@ -1689,11 +2008,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
     uint32_t cf = getreg32(I2S_TX_CONF_REG(priv->config->port));
 
     g_tx_state_post = st;
-    syslog(LOG_INFO,
-           "[V347] tx start verify: START=%d STATE=0x%08x idle=%d "
-           "(stop_spins=%d state_pre=0x%08x)\n",
-           (int)!!(cf & I2S_TX_START), (unsigned)st, (int)(st & 1u),
-           g_tx_stop_spins, (unsigned)g_tx_state_pre);
+    
   }
 
 
@@ -1729,10 +2044,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
 
         if ((st & 1u) == 0)
           {
-            syslog(LOG_INFO,
-                   "[V350] re-arm %d: TX running STATE=0x%08x OUTFIFO=0x%08x "
-                   "LINK=0x%08x\n",
-                   tries, (unsigned)st, (unsigned)fifo, (unsigned)link);
+            
             break;
           }
 
@@ -1750,15 +2062,7 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
             }
         }
 
-        syslog(LOG_INFO,
-               "[V350] re-arm %d: retried STATE=0x%08x OUTFIFO=0x%08x "
-               "LINK=0x%08x PARK=%d\n",
-               tries,
-               (unsigned)getreg32(I2S_STATE_REG(port)),
-               (unsigned)GET_GDMA_CH_REG(DMA_OUTFIFO_STATUS_CH0_REG, ch),
-               (unsigned)GET_GDMA_CH_REG(DMA_OUT_LINK_CH0_REG, ch),
-               /* DMA_OUTLINK_PARK_CH0 is bit 23 of DMA_OUT_LINK_CHn_REG */
-               (int)!!(GET_GDMA_CH_REG(DMA_OUT_LINK_CH0_REG, ch) & (1u << 23)));
+        
       }
   }
 
@@ -1795,10 +2099,445 @@ static int IRAM_ATTR i2s_txdma_start(struct esp32s3_i2s_s *priv)
 /* [V390] A/B switch: 1 = run the receiver as I2S master (own divider),
  * 0 = keep it as a slave of the TX generator (the current behaviour).
  */
-volatile int g_v390_rxmaster = 1;
+/* [V913] *** The receiver is a SLAVE to the transmitter's clock. ***
+ *
+ * This is the one variable V913 changes.  What it decides is not the
+ * bit rate -- both roles measure 15857 frames/s and BCK measures
+ * 512 kHz either way -- but where the receiver's bit counter takes
+ * its edges from:
+ *
+ *   master (1)  RX_CONF bit3 RX_SLAVE_MOD = 0.  The receiver runs
+ *               its own divider and generates its own frame, while
+ *               the pads carry TX's I2S0O_BCK_OUT / I2S0O_WS_OUT.
+ *               Two free-running dividers.  The driver says it
+ *               itself (see the [V694]/[V727] notes): "the phase
+ *               between two free-running dividers decides, and it
+ *               is set by where each happened to start".
+ *
+ *   slave  (0)  RX_CONF bit3 RX_SLAVE_MOD = 1.  The receiver takes
+ *               I2S0I_BCK_IN / I2S0I_WS_IN, which [V386] already
+ *               wired to the very same pads.  One divider -- the
+ *               transmitter's -- so there is no second phase and
+ *               nothing left for a boot to randomise.
+ *
+ * V912 measured the master arm precisely: three cold boots, k in
+ * {1, 2, 9} (down from V911's {0,2,4,9,10,13}), RELOCK 0, conf1
+ * pinned at 0x2f3de38f, negative ratio ~50%.  Adding I2S_RX_RESET
+ * narrowed k but could not zero it, which is the signature of a
+ * phase that a state-machine reset does not control.
+ *
+ * Preconditions V912 already delivered: ws = 15 sticks, conf1 is
+ * constant, RELOCK is gone, RX_RESET is in place.  The audit asked
+ * for B only after A landed.  A has landed.
+ *
+ * Every write site below is locked to 0 for this build, so a stale
+ * /tmp/rxrole.txt cannot put the second divider back. */
+volatile int g_v390_rxmaster = 0;
+
+/* [V858] *** The receiver's clock role, and the counters behind the
+ * post-playback relock. ***
+ *
+ * g_v858_rxslave is the role the relock programs:
+ *   1 = the receiver is a slave and takes BCK/WS from the pads, which
+ *       carry the transmitter generator's frame clock
+ *   0 = the receiver runs from its own divider
+ * The self-heal in voice_channel.c flips it, because which of the two
+ * lands in phase with the ES8311 depends on where the two dividers
+ * happened to start on this boot -- see the measurements in the [V858]
+ * comment on i2s_v858_relock() below. */
+
+volatile int g_v858_rxslave  = 1;
+volatile int g_v858_relocks;
+volatile int g_v858_heals;
 volatile int g_v388_pre_spins;
 volatile int g_v388_post_spins;
 volatile int g_v388_logs;
+
+/* [V691] *** the microphone root cause ***
+ *
+ * Every pin sample on record falls into exactly two states:
+ *
+ *   txstart=1, rxstart=0 ->  BCLK(10)=995..1004/2000,
+ *                            WS(8)=1002..1014/2000,
+ *                            DIN(9)=404..739/2000     <- all three ALIVE
+ *   txstart=0, rxstart=1 ->  BCLK(10)=0/2000,
+ *                            WS(8)=2000/2000 (stuck),
+ *                            DIN(9)=0/2000             <- all three DEAD
+ *
+ * DIN only moves while I2S_TX_START is set.  The pads carry the TX
+ * generator's BCK/WS (see the [V390] note in i2s_configure), so with
+ * TX_START cleared the ES8311 has no bit clock, never drives DIN, and the
+ * self-clocked receiver shifts in a static pad level -- exactly the
+ * constant 0xFFFA (peak=6) every chunk has shown since v658.
+ *
+ * esp32s3_i2s_set_rxonly() clears TX_START and i2s_configure() pulses
+ * I2S_TX_RESET; the [V382] clock-only start in i2s_rx_channel_start() is
+ * undone a few lines later by i2s_configure() and nothing restores it.
+ *
+ * This helper puts it back.  It only acts while a capture is armed, so the
+ * playback path is not affected.  verbose=0 must be used where it can run
+ * in interrupt context (see the [V393] IRQ-stack note).
+ */
+
+static unsigned long g_v691_rearm;
+
+/* [V724] *************************************************************
+ * Read-only forensic probe for the "RX collapses after playback" defect.
+ *
+ * Nothing here changes hardware state on its own.  The register writes
+ * are gated behind /tmp/i2sw.txt, which exists only when a person puts
+ * it there -- the v721 lesson, where a self-driving sweep table quietly
+ * reprogrammed RX_MSB_SHIFT and sent the diagnosis down a blind alley
+ * ("clipping, lower the gain"), is exactly what this must not repeat.
+ */
+
+#define V724_REGLIST(X, p)                                     \
+  X("CONF_SIGLE", I2S_CONF_SIGLE_DATA_REG,   p)                \
+  X("INT_RAW",    I2S_INT_RAW_REG,           p)                \
+  X("INT_ST",     I2S_INT_ST_REG,            p)                \
+  X("INT_ENA",    I2S_INT_ENA_REG,           p)                \
+  X("LC_HUNG",    I2S_LC_HUNG_CONF_REG,      p)                \
+  X("STATE",      I2S_STATE_REG,             p)                \
+  X("RX_CONF",    I2S_RX_CONF_REG,           p)                \
+  X("RX_CONF1",   I2S_RX_CONF1_REG,          p)                \
+  X("RX_TDM",     I2S_RX_TDM_CTRL_REG,       p)                \
+  X("RX_TIMING",  I2S_RX_TIMING_REG,         p)                \
+  X("RX_EOFNUM",  I2S_RXEOF_NUM_REG,         p)                \
+  X("RX_CLKM",    I2S_RX_CLKM_CONF_REG,      p)                \
+  X("RX_CLKDIV",  I2S_RX_CLKM_DIV_CONF_REG,  p)                \
+  X("TX_CONF",    I2S_TX_CONF_REG,           p)                \
+  X("TX_CONF1",   I2S_TX_CONF1_REG,          p)                \
+  X("TX_TDM",     I2S_TX_TDM_CTRL_REG,       p)                \
+  X("TX_TIMING",  I2S_TX_TIMING_REG,         p)                \
+  X("TX_CLKM",    I2S_TX_CLKM_CONF_REG,      p)                \
+  X("TX_CLKDIV",  I2S_TX_CLKM_DIV_CONF_REG,  p)
+
+static uint32_t g_v724_prev[24];
+static int      g_v724_init;
+
+static int v724_streq(const char *a, const char *b)
+{
+  while (*a != '\0' && *a == *b)
+    {
+      a++;
+      b++;
+    }
+
+  return (*a == '\0' && *b == '\0');
+}
+
+/* A bare block, not do/while(0): the list expands to twenty of these in
+ * a row and only the last one would get the semicolon.
+ */
+
+#define V724_CAP(nm, reg, p)                                        \
+  {                                                                 \
+    uint32_t v724v = getreg32(reg(p));                              \
+                                                                    \
+    if (!g_v724_init || v724v != g_v724_prev[v724i])                \
+      {                                                             \
+        if (g_v724_init && v724n < 10)                              \
+          {                                                         \
+            V1024S(LOG_INFO, "[V724]] %s %s 0x%08x -> 0x%08x\n",      \
+                   tag, nm, (unsigned)g_v724_prev[v724i],           \
+                   (unsigned)v724v);                                \
+            v724n++;                                                \
+          }                                                         \
+                                                                    \
+        g_v724_prev[v724i] = v724v;                                 \
+      }                                                             \
+                                                                    \
+    v724i++;                                                        \
+  }
+
+/* Print only what moved.  The first call seeds the shadow copy. */
+
+static void i2s_v724_diff(int port, const char *tag)
+{
+  int v724i = 0;
+  int v724n = 0;
+
+  V724_REGLIST(V724_CAP, port)
+  g_v724_init = 1;
+}
+
+#define V724_WR(nm, reg, p)                                         \
+  {                                                                 \
+    if (v724_streq(v724name, nm))                                   \
+      {                                                             \
+        putreg32(v724val, reg(p));                                  \
+        return 1;                                                   \
+      }                                                             \
+  }
+
+static int i2s_v724_write(int port, const char *v724name,
+                          uint32_t v724val)
+{
+  V724_REGLIST(V724_WR, port)
+  return 0;
+}
+
+/* [V724-C] /tmp/i2sw.txt, one "NAME 0xVALUE" pair per line.  Applied
+ * straight from the rx completion path, so a candidate fix is live in
+ * about a hundred milliseconds and no reflash is needed to test it.
+ */
+
+static void i2s_v724_hook(int port)
+{
+  static unsigned long s_v724_seen;
+  FILE   *v724f;
+  char    v724buf[256];
+  size_t  v724n;
+  size_t  v724i;
+  size_t  v724j;
+  unsigned long v724sum = 0u;
+  int     v724applied = 0;
+
+  v724f = fopen("/tmp/i2sw.txt", "r");
+  if (v724f == NULL)
+    {
+      s_v724_seen = 0u;
+      return;
+    }
+
+  v724n = fread(v724buf, 1, sizeof(v724buf) - 1u, v724f);
+  fclose(v724f);
+  v724buf[v724n] = '\0';
+
+  v724i = 0u;
+  while (v724i < v724n)
+    {
+      char     v724nm[32];
+      unsigned v724k = 0u;
+      uint32_t v724val = 0u;
+      int      v724ok = 0;
+
+      while (v724i < v724n &&
+             (v724buf[v724i] == ' ' || v724buf[v724i] == '\t' ||
+              v724buf[v724i] == '\n' || v724buf[v724i] == '\r'))
+        {
+          v724i++;
+        }
+
+      if (v724i >= v724n)
+        {
+          break;
+        }
+
+      while (v724i < v724n && v724buf[v724i] != ' ' &&
+             v724buf[v724i] != '\t' && v724buf[v724i] != '\n' &&
+             v724buf[v724i] != '\r' && v724k < (sizeof(v724nm) - 1u))
+        {
+          v724nm[v724k++] = v724buf[v724i++];
+        }
+
+      v724nm[v724k] = '\0';
+
+      while (v724i < v724n &&
+             (v724buf[v724i] == ' ' || v724buf[v724i] == '\t'))
+        {
+          v724i++;
+        }
+
+      if ((v724i + 1u) < v724n && v724buf[v724i] == '0' &&
+          (v724buf[v724i + 1u] == 'x' || v724buf[v724i + 1u] == 'X'))
+        {
+          v724i += 2u;
+        }
+
+      while (v724i < v724n)
+        {
+          char     c = v724buf[v724i];
+          unsigned d;
+
+          if (c >= '0' && c <= '9')
+            {
+              d = (unsigned)(c - '0');
+            }
+          else if (c >= 'a' && c <= 'f')
+            {
+              d = (unsigned)(c - 'a') + 10u;
+            }
+          else if (c >= 'A' && c <= 'F')
+            {
+              d = (unsigned)(c - 'A') + 10u;
+            }
+          else
+            {
+              break;
+            }
+
+          v724val = (v724val << 4) | d;
+          v724i++;
+          v724ok = 1;
+        }
+
+      while (v724i < v724n && v724buf[v724i] != '\n')
+        {
+          v724i++;
+        }
+
+      v724i++;
+
+      if (v724ok && v724nm[0] != '\0')
+        {
+          v724sum = v724sum * 131u + (unsigned long)v724val +
+                    (unsigned long)v724nm[0];
+
+          if (i2s_v724_write(port, v724nm, v724val))
+            {
+              v724applied++;
+            }
+        }
+    }
+
+  if (v724sum != s_v724_seen)
+    {
+      s_v724_seen = v724sum;
+      V1024S(LOG_INFO, "[V724]] hook: %d pair(s) written\n", v724applied);
+    }
+}
+
+/* [V724-D] /tmp/pins.txt -- is the codec actually driving DIN?
+ *
+ * The [V383] block inside i2s_rx_channel_start() already knows how to
+ * do this but its syslog is compiled behind "if (0)".  Same 4000 reads,
+ * now on demand:
+ *
+ *   BCLK(10) hi ~= 2000/4000  the frame clock is running
+ *   WS(8)    hi ~= 2000/4000  frames are being delimited
+ *   DIN(9)   hi ~= 2000/4000  the ES8311 is shifting data at us
+ *   either extreme            that line is stuck
+ */
+
+static void i2s_v724_pins(void)
+{
+  FILE        *v724f;
+  unsigned int v724b = 0u;
+  unsigned int v724w = 0u;
+  unsigned int v724d = 0u;
+  unsigned int v724k;
+
+  v724f = fopen("/tmp/pins.txt", "r");
+  if (v724f == NULL)
+    {
+      return;
+    }
+
+  fclose(v724f);
+
+  modifyreg32(IO_MUX_GPIO8_REG,  0, (1u << 9));   /* WS   */
+  modifyreg32(IO_MUX_GPIO9_REG,  0, (1u << 9));   /* DIN  */
+  modifyreg32(IO_MUX_GPIO10_REG, 0, (1u << 9));   /* BCLK */
+
+  for (v724k = 0u; v724k < 4000u; v724k++)
+    {
+      if (esp32s3_gpioread(10))
+        {
+          v724b++;
+        }
+
+      if (esp32s3_gpioread(8))
+        {
+          v724w++;
+        }
+
+      if (esp32s3_gpioread(9))
+        {
+          v724d++;
+        }
+    }
+
+  V1024S(LOG_INFO, "[V724]] pins BCLK(10) hi=%u WS(8) hi=%u DIN(9) hi=%u /4000\n",
+         v724b, v724w, v724d);
+}
+
+/* [V714] *** Rate limiter for the [V692] probe below. ***
+ *
+ * g_v692_stopfix only increments when I2S_TX_STOP_EN was actually found
+ * set, and that happens once per capture -- so it parks at 1 for the whole
+ * run.  The old guard
+ *
+ *     if (verbose && (g_v692_stopfix <= 6 || (g_v692_stopfix % 64) == 0))
+ *
+ * therefore stayed true on every call and the probe printed one line per RX
+ * buffer completion: ~17 lines/s, which drowned the NSH console and crowded
+ * the 32 KB kmsg ring.  Count the calls instead of the stopfixes. */
+
+static unsigned long g_v714_calls;
+static unsigned long g_v714_lastfix = ~0ul;
+
+static unsigned long g_v692_stopfix;
+
+static void i2s_v691_clock_ensure(struct esp32s3_i2s_s *priv, int verbose)
+{
+  uint32_t port = priv->config->port;
+  int spins;
+
+  /* Nothing armed -> not a capture -> leave the port alone. */
+
+  if (sq_empty(&priv->rx.act) && sq_empty(&priv->rx.pend))
+    {
+      return;
+    }
+
+  /* [V692] *** I2S_TX_STOP_EN (bit13) is what actually kills the frame
+   * clock. ***
+   *
+   * ESP-IDF's i2s_ll_tx_set_stop_when_empty() maps auto_clear to this bit:
+   * with it set, the transmitter halts as soon as its FIFO runs dry.  The
+   * capture uses the transmitter purely as a clock generator, so its FIFO
+   * is ALWAYS dry -- it stops on the first frame and BCK/WS drop to their
+   * idle levels.
+   *
+   * Measured, and perfectly consistent with that bit:
+   *   txconf=0x00089264  STOP_EN clear -> BCLK 995..1004/2000,
+   *                                        WS  1002..1014/2000,
+   *                                        DIN 404..739/2000      ALIVE
+   *   txconf=0x0008b2xx  STOP_EN set   -> BCLK 0/2000,
+   *                                        WS  2000/2000 (stuck),
+   *                                        DIN 0/2000             DEAD
+   *
+   * Cleared only while a capture is armed; i2s_configure() puts it back
+   * for the playback path.
+   */
+
+  if (getreg32(I2S_TX_CONF_REG(port)) & I2S_TX_STOP_EN)
+    {
+      modifyreg32(I2S_TX_CONF_REG(port), I2S_TX_STOP_EN, 0);
+      g_v692_stopfix++;
+    }
+
+  if (!(getreg32(I2S_TX_CONF_REG(port)) & I2S_TX_START))
+    {
+      modifyreg32(I2S_TX_CONF_REG(port), 0, I2S_TX_START);
+      g_v691_rearm++;
+    }
+
+  modifyreg32(I2S_TX_CONF_REG(port), 0, I2S_TX_UPDATE);
+
+  for (spins = 0;
+       spins < I2S_UPDATE_SPIN_MAX &&
+       (getreg32(I2S_TX_CONF_REG(port)) & I2S_TX_UPDATE);
+       spins++)
+    {
+    }
+
+  g_v691_rearm++;
+
+  g_v714_calls++;
+
+  if (verbose && (g_v714_calls <= 6 || (g_v714_calls % 2048) == 0 ||
+                  g_v692_stopfix != g_v714_lastfix))
+    {
+      g_v714_lastfix = g_v692_stopfix;
+      V1024S(LOG_INFO, "[V692]] tx clock: stopfix=%lu rearm=%lu spins=%d txconf=0x%08x "
+             "rxconf=0x%08x\n",
+             g_v692_stopfix, g_v691_rearm, spins,
+             (unsigned)getreg32(I2S_TX_CONF_REG(port)),
+             (unsigned)getreg32(I2S_RX_CONF_REG(port)));
+    }
+}
 
 #ifdef I2S_HAVE_RX
 static int i2s_rxdma_start(struct esp32s3_i2s_s *priv)
@@ -1839,9 +2578,58 @@ static int i2s_rxdma_start(struct esp32s3_i2s_s *priv)
    * merely mis-programmed.  See patch_v385.py.
    */
 
-  eof_nbytes = MIN(512, bfcontainer->nbytes);
+  /* [V687] Size the EOF threshold to the WHOLE buffer.
+   *
+   * I2S_RX_EOF_NUM counts BITS (hardware/esp32s3_i2s.h:1841):
+   *   "The receive data bit length is (I2S_RX_BITS_MOD[4:0] + 1) *
+   *    (REG_RX_EOF_NUM[11:0] + 1).  It will trigger in_suc_eof
+   *    interrupt in the configured DMA RX channel."
+   * so for 16-bit words the trigger in bytes is 2 * (N + 1).
+   *
+   * v385 programmed 512, i.e. a 1026-byte trigger, while the buffer the
+   * app hands us is 4096 bytes, which CONFIG_I2S_DMADESC_NUM=2 splits
+   * into 4095 + 1 descriptors.  Both consumers of the EOF bit only look
+   * at the FIRST EOF-marked descriptor: i2s_rx_schedule() completes the
+   * transfer only when DMA_IN_SUC_EOF_DES_ADDR names the last EOF-marked
+   * descriptor, and i2s_rx_worker() sums DATALEN only while the EOF bit
+   * is set.  With the EOF in the middle of descriptor 0 every arm
+   * delivered ~1 KB of 4 KB and the capture starved: v686
+   * (_v686_btnfix.log, one 8 s press) logged 6 chunks / 9208 bytes where
+   * ~256000 were expected, a single SUC_EOF for the whole session, and
+   * three "recording thread exit" lines.
+   *
+   * Keep the trigger just INSIDE the first descriptor.  2044 -> 16 * 2045
+   * bits = 4090 bytes, which fits either possible first-descriptor size
+   * (4092 with burst, 4095 without); the six tail bytes are 0.15% of the
+   * stream.  A buffer small enough to be a single descriptor takes the
+   * exact whole-buffer value, which is lossless.
+   *
+   * v385's "descriptor chain runs off its NULL tail" failure is what
+   * happens when the trigger EXCEEDS the chain - MIN(nbytes, 4095) asked
+   * for 8192 bytes over a 4096-byte inlink, the chain ended before EOF and
+   * no SUC_EOF was ever raised.  Never program more than the chain holds.
+   */
 
-  /* [V394] IRQ-stack: silenced */ if (0) syslog(LOG_INFO, "[V385] rx eof_num=%u (nbytes=%u)\n",
+  if (bfcontainer->nbytes >= 4u && bfcontainer->nbytes <= 4092u)
+    {
+      eof_nbytes = (size_t)(bfcontainer->nbytes / 2u) - 1u;
+    }
+  else
+    {
+      eof_nbytes = 2044u;
+    }
+
+  /* [V905] 2046 -> 2048 bytes: a whole number of 2-slot frames, so the
+   * block no longer ends half way through one and the live slot keeps the
+   * same parity from buffer to buffer.  Runs from interrupt level too --
+   * read only, no logging. */
+
+  if (g_v905_eof != 0u)
+    {
+      eof_nbytes = (size_t)g_v905_eof;
+    }
+
+  /* [V394] IRQ-stack: silenced */ if (0) V1024S(LOG_INFO, "[V385]] rx eof_num=%u (nbytes=%u)\n",
          (unsigned)eof_nbytes, (unsigned)bfcontainer->nbytes);
 
   modifyreg32(I2S_RXEOF_NUM_REG(priv->config->port), I2S_RX_EOF_NUM_M,
@@ -1894,6 +2682,67 @@ static int i2s_rxdma_start(struct esp32s3_i2s_s *priv)
     g_v388_pre_spins = spins;
   }
 
+  /* [V681] Mono capture takes ONE sample per frame.
+   *
+   * i2s_configure()'s RX branch enables CHAN0_EN and CHAN1_EN at the same
+   * bit positions as the TX 2x-speed bug fixed in v669, so the RX FIFO
+   * handed the DMA two samples per frame.  The board captures mono, and
+   * with no_dac_ref the mic sits in slot 0, so only slot 0 must be armed.
+   * Done on every arm so no later configure can undo it.
+   */
+  /* [V682] *** the real root cause of the silent microphone ***
+   *
+   * The chan_en half of rx_tdm_ctrl must be ASSIGNED, not modified.
+   * esp32s3_i2s.h:1359 says I2S_RX_TDM_PDM_CHAN0_EN has "default: 1'h1",
+   * so bits 2..15 come out of reset ENABLED.  modifyreg32() with only the
+   * CHAN0_EN|CHAN1_EN mask never cleared them, and the register read back
+   * as 0x0001ffff: sixteen channels armed for a frame that carries two
+   * slots.  The receiver de-serialises against a 16-channel map, so what
+   * it stores is not what the codec sent -- every chunk was silence.
+   *
+   * ESP-IDF does it this way (hal/esp32s3/include/hal/i2s_ll.h):
+   *
+   *     tdm_ctrl  = hw->rx_tdm_ctrl.val;
+   *     tdm_ctrl &= 0xFFFF0000;      <-- clears all sixteen chanN_en
+   *     tdm_ctrl |= chan_mask;       <-- then the wanted slots only
+   *     hw->rx_tdm_ctrl.val = tdm_ctrl;
+   *
+   * i2s_ll_rx_select_std_slot() passes 0x01 (left) / 0x02 (right) /
+   * 0x03 (both) for the 2-slot frame it just set up.  The transmitter
+   * never had this bug because i2s_txchannels() assigns the whole word --
+   * which is exactly why playback has always worked.
+   */
+  {
+    uint32_t v682_tdm = getreg32(I2S_RX_TDM_CTRL_REG(priv->config->port));
+
+    v682_tdm &= 0xffff0000u;
+    v682_tdm |= FIELD_TO_VALUE(I2S_RX_TDM_TOT_CHAN_NUM, 1);  /* 2 slots */
+    v682_tdm |= g_i2s_rx_slot_mask;
+    putreg32(v682_tdm, I2S_RX_TDM_CTRL_REG(priv->config->port));
+  }
+  {
+    static int s_v681_logged;
+    if (s_v681_logged < 3)
+      {
+        s_v681_logged++;
+        V1024S(LOG_INFO, "[V683]] rx tdm=0x%08x slot=0x%02x conf1=0x%08x "
+               "clkm=0x%08x clkdiv=0x%08x eofnum=0x%08x dw=%lu rate=%lu "
+               "mclk=%lu mult=%lu ch=%lu\n",
+               (unsigned)getreg32(I2S_RX_TDM_CTRL_REG(priv->config->port)),
+               (unsigned)g_i2s_rx_slot_mask,
+               (unsigned)getreg32(I2S_RX_CONF1_REG(priv->config->port)),
+               (unsigned)getreg32(I2S_RX_CLKM_CONF_REG(priv->config->port)),
+               (unsigned)getreg32(I2S_RX_CLKM_DIV_CONF_REG(
+                                      priv->config->port)),
+               (unsigned)getreg32(I2S_RXEOF_NUM_REG(priv->config->port)),
+               (unsigned long)priv->data_width,
+               (unsigned long)priv->rate,
+               (unsigned long)priv->mclk_freq,
+               (unsigned long)priv->mclk_multiple,
+               (unsigned long)priv->channels);
+      }
+  }
+
   modifyreg32(I2S_RX_CONF_REG(priv->config->port), 0, I2S_RX_START);
 
   {
@@ -1911,11 +2760,15 @@ static int i2s_rxdma_start(struct esp32s3_i2s_s *priv)
     g_v388_post_spins = spins;
   }
 
+  /* [V691] Restore the TX clock generator the moment the RX is armed.
+   * No syslog here: this function also runs in IRQ context. */
+
+  i2s_v691_clock_ensure(priv, 0);
+
   if (g_v388_logs < 4)
     {
       g_v388_logs++;
-      /* [V394] IRQ-stack: silenced */ if (0) syslog(LOG_INFO,
-             "[V388] rx_update spins pre=%d post=%d rxconf=0x%08x "
+      /* [V394] IRQ-stack: silenced */ if (0) V1024S(LOG_INFO, "[V388]] rx_update spins pre=%d post=%d rxconf=0x%08x "
              "eofnum=0x%08x fifo=0x%08x intena=0x%08x\n",
              g_v388_pre_spins, g_v388_post_spins,
              (unsigned)getreg32(I2S_RX_CONF_REG(priv->config->port)),
@@ -1928,8 +2781,7 @@ static int i2s_rxdma_start(struct esp32s3_i2s_s *priv)
        *   bit0 RX_DONE, bit1 TX_DONE, bit2 RX_HUNG, bit3 TX_HUNG
        * and rx_tdm_ctrl is the register V389 now programs.
        */
-      /* [V394] IRQ-stack: silenced */ if (0) syslog(LOG_INFO,
-             "[V389] intraw=0x%08x rxtdmctrl=0x%08x rxconf1=0x%08x\n",
+      /* [V394] IRQ-stack: silenced */ if (0) V1024S(LOG_INFO, "[V389]] intraw=0x%08x rxtdmctrl=0x%08x rxconf1=0x%08x\n",
              (unsigned)getreg32(I2S_INT_RAW_REG(priv->config->port)),
              (unsigned)getreg32(I2S_RX_TDM_CTRL_REG(priv->config->port)),
              (unsigned)getreg32(I2S_RX_CONF1_REG(priv->config->port)));
@@ -1970,27 +2822,9 @@ static int i2s_rxdma_start(struct esp32s3_i2s_s *priv)
               }
           }
 
-        syslog(LOG_INFO,
-               "[V387] waited=%u LINK=0x%08x RAW=0x%08x ST=0x%08x "
-               "PSEL=0x%08x\n",
-               (unsigned)k,
-               (unsigned)GET_GDMA_CH_REG(DMA_IN_LINK_CH0_REG,
-                                          priv->dma_channel),
-               (unsigned)GET_GDMA_CH_REG(DMA_IN_INT_RAW_CH0_REG,
-                                          priv->dma_channel),
-               (unsigned)GET_GDMA_CH_REG(DMA_IN_INT_ST_CH0_REG,
-                                          priv->dma_channel),
-               (unsigned)GET_GDMA_CH_REG(DMA_IN_PERI_SEL_CH0_REG,
-                                          priv->dma_channel));
+        
 
-        syslog(LOG_INFO,
-               "[V387] desc0 ctrl=0x%08x pbuf=%p next=%p | "
-               "i2sintst=0x%08x rxconf=0x%08x\n",
-               (unsigned)bfcontainer->dma_link[0].ctrl,
-               (void *)bfcontainer->dma_link[0].pbuf,
-               (void *)bfcontainer->dma_link[0].next,
-               (unsigned)getreg32(I2S_INT_ST_REG(priv->config->port)),
-               (unsigned)getreg32(I2S_RX_CONF_REG(priv->config->port)));
+        
       }
   }
 
@@ -2214,6 +3048,7 @@ static int i2s_rxdma_setup(struct esp32s3_i2s_s *priv,
    * strategy: DMA into an internal-SRAM bounce slot, then i2s_rx_worker()
    * copies the received bytes back into the apb and returns the slot. */
 
+  
   bfcontainer->buf = NULL;
   uint8_t *rx_target = bfcontainer->apb->samp;
   if (esp32s3_ptr_extram(rx_target))
@@ -2223,13 +3058,56 @@ static int i2s_rxdma_setup(struct esp32s3_i2s_s *priv,
         {
           i2serr("[RXBOUNCE] no internal-SRAM slot for %u bytes\n",
                  (unsigned)bfcontainer->nbytes);
-          return -ENOMEM;
+
+          /* [V755] *** The bounce pool is shared with the TX path. ***
+           *
+           * A playback whose GDMA never raised its completion interrupt
+           * leaves its containers parked in priv->tx.act for ever:
+           * i2s_txdma_start() bails out while tx.act is non-empty, and
+           * until v755 there was no TX-side counterpart of
+           * i2s_rx_release_inflight() to reclaim them.  With
+           * CONFIG_ES8311_INFLIGHT=2 two stuck playbacks occupy all
+           * I2S_DMABUF_SLOTS=4 slots and every later capture fails with
+           * -ENOMEM here, which the upper half surfaces as
+           * "capture EIO" and an endless "listen: no speech for 8000
+           * ms, restarting session" loop -- the UI frozen on
+           * "Start listening".
+           *
+           * Reclaim the stalled TX buffers and try once more.  This is
+           * self-healing on the exact path that used to die, and it
+           * costs nothing on the healthy path (the pool is never full
+           * there).  esp32s3_i2s_tx_flush() itself returns immediately
+           * when all three TX queues are empty, so a live playback is
+           * never torn down by this. */
+
+          esp32s3_i2s_tx_flush();
+
+          bfcontainer->buf = i2s_dmabuf_alloc(bfcontainer->nbytes);
+          if (bfcontainer->buf == NULL)
+            {
+              return -ENOMEM;
+            }
         }
 
-      syslog(LOG_INFO, "[RXBOUNCE] apb samp %p in PSRAM -> bounce %p\n",
-             (void *)bfcontainer->apb->samp, (void *)bfcontainer->buf);
+      /* [V659] Rate-limited: this is one line per received buffer, so a
+       * capture session alone produced ~190 of them and helped push the real
+       * diagnostics out of the 32 KB kmsg ring. */
+
+      {
+        static unsigned s_v659_bounce;
+
+        if (s_v659_bounce < 4u || (s_v659_bounce % 256u) == 0u)
+          {
+            syslog(LOG_INFO, "[RXBOUNCE] apb samp %p in PSRAM -> bounce %p\n",
+                   (void *)bfcontainer->apb->samp, (void *)bfcontainer->buf);
+          }
+
+        s_v659_bounce++;
+      }
       rx_target = bfcontainer->buf;
     }
+
+  
 
   /* Configure DMA stream */
 
@@ -2237,6 +3115,10 @@ static int i2s_rxdma_setup(struct esp32s3_i2s_s *priv,
                                    rx_target,
                                    bfcontainer->nbytes, I2S_RX,
                                    priv->dma_channel);
+
+  
+
+  
 
   if (bytes_queued != bfcontainer->nbytes)
     {
@@ -2248,7 +3130,71 @@ static int i2s_rxdma_setup(struct esp32s3_i2s_s *priv,
       return -bytes_queued;
     }
 
+  /* [V905] *** DMA block length: 2046 -> 2048 bytes per block. ***
+   *
+   * The receiver runs a TWO-slot frame (TOT_CHAN_NUM = 1 keeps BCLK at
+   * 32 x fs for the ES8311), so one frame is 4 bytes.  i2s_rxdma_start()
+   * asks for nbytes/2 - 1 = 2045 and the hardware writes DATALEN = N + 1
+   * = 2046 bytes: 1023 words, i.e. 511.5 frames.  Every block therefore
+   * ends half way through a frame and the next one starts on the other
+   * half, which flips which slot is live from buffer to buffer -- the
+   * parity flip the [V707] comment at :3492 already describes.
+   *
+   * 2047 -> DATALEN 2048 = 1024 words = 512 whole frames, a multiple of 4.
+   * That fits inside desc0 (SIZE 4092) and inside the 12-bit
+   * I2S_RX_EOF_NUM field (max 4095), so neither the descriptor nor the
+   * bounce slot has to change size:
+   *
+   *   nmaxbytes 4092 | bounce alloc 4092 (<= slot 4096) | desc SIZE 4092
+   *   [RXBOUNCE] ncopy = min(2048, 4092) = 2048   -- nothing truncated.
+   *
+   * /tmp/eof.txt overrides the value so the N -> DATALEN offset can be
+   * swept without a reflash: first decimal number, 64..4095.
+   *
+   * Polled HERE and not in i2s_rxdma_start(): that one runs under the
+   * driver spinlock from here and from interrupt level via
+   * i2s_rx_schedule(), so it may not call fopen(). */
+  {
+    static unsigned s_v905_arm;
+
+    if ((s_v905_arm++ & 31u) == 0u)
+      {
+        FILE *v905f = fopen("/tmp/eof.txt", "r");
+
+        if (v905f != NULL)
+          {
+            int      v905c = fgetc(v905f);
+            unsigned v905v = 0u;
+
+            while (v905c >= '0' && v905c <= '9')
+              {
+                v905v = (v905v * 10u) + (unsigned)(v905c - '0');
+                v905c = fgetc(v905f);
+              }
+
+            fclose(v905f);
+
+            if (v905v >= 64u && v905v <= 4095u && v905v != g_v905_eof)
+              {
+                V1024S(LOG_INFO, "[V905]] EOF override %u -> %u (nbytes=%u)\n",
+                       g_v905_eof, v905v,
+                       (unsigned)bfcontainer->nbytes);
+                g_v905_eof = v905v;
+              }
+          }
+      }
+
+    if ((s_v905_arm & 2047u) == 0u)
+      {
+        V1024S(LOG_INFO, "[V905]] EOF nbytes=%u eof=%u (target 2048 B = 1024 words "
+               "= 512 whole 2-slot frames)\n",
+               (unsigned)bfcontainer->nbytes, g_v905_eof);
+      }
+  }
+
   flags = spin_lock_irqsave(&priv->slock);
+
+  
 
   /* Add the buffer container to the end of the RX pending queue */
 
@@ -2256,9 +3202,15 @@ static int i2s_rxdma_setup(struct esp32s3_i2s_s *priv,
 
   /* Trigger DMA transfer if no transmission is in progress */
 
+  
+
   ret = i2s_rxdma_start(priv);
 
+  
+
   spin_unlock_irqrestore(&priv->slock, flags);
+
+  
 
   return ret;
 }
@@ -2504,8 +3456,7 @@ static void i2s_tx_worker(void *arg)
 
   g_worker_n++;   /* [V345] */
 
-  i2sinfo("tx.act.head=%p tx.done.head=%p\n",
-          priv->tx.act.head, priv->tx.done.head);
+  
 
   /* Process each buffer in the tx.done queue */
 
@@ -2554,6 +3505,678 @@ static void i2s_tx_worker(void *arg)
  ****************************************************************************/
 
 #ifdef I2S_HAVE_RX
+
+/* [V717] Configure generation.  Bumped once per i2s_configure() with the
+ * receiver active.  Two consumers: the RX override block uses it to index
+ * the profile table (one profile per always-on listening session), and the
+ * [V709] forensic dump re-arms itself whenever it changes, so every profile
+ * gets its own raw frame without any file or NSH involvement.
+ *
+ * Why: the v716 file hooks never fired.  NSH itself was proven healthy
+ * (`echo hello123` and `touch /tmp/v709dump.txt` both echoed back, so the
+ * files exist), yet `[V716] rxregs` and `[V709] raw` produced zero lines in
+ * steady state while `[V716] rate`, from the same DMA callback, produced
+ * dozens.  The RX block of i2s_configure() simply is not re-entered the way
+ * the boot path is, so a hook that needs an operator to install it can end
+ * up never applying -- which is exactly what the p1..p4 sweep showed: every
+ * profile delivered the same ~33,900 B/s. */
+
+static volatile unsigned g_v717_gen;
+
+
+/* [V908] ***************************************************************
+ * Alignment scanner -- replace "guess one register, reflash, hope" with a
+ * bounded search over every field that decides WHICH bit clock the receiver
+ * first samples and HOW MANY bit clocks it takes per slot.
+ *
+ * The six rounds before this one each changed one guessed register and each
+ * cost a full build/flash cycle.  Since V907 gave a zero-variance criterion
+ * (lnz, the share of this block's samples whose low eight bits are non-zero)
+ * the search can be done on the device instead, in about eight seconds, and
+ * it reports every candidate -- including the ones that fail, because ruling
+ * out a dimension is worth as much as finding one.
+ *
+ * Field definitions come from the two files that actually define them:
+ *
+ *   nuttx/arch/xtensa/src/esp32s3/hardware/esp32s3_i2s.h
+ *   nuttx/arch/xtensa/src/esp32s3/esp-hal-3rdparty/components/soc/esp32s3/
+ *     include/soc/i2s_struct.h
+ *
+ *   I2S_RX_CONF_REG  (0x20)
+ *     bit  1  I2S_RX_FIFO_RESET
+ *     bit  2  I2S_RX_START
+ *     bit  8  I2S_RX_UPDATE        latch APB -> RX clock domain
+ *     bit 15  I2S_RX_LEFT_ALIGN    1: left alignment, 0: right alignment
+ *     bit 17  I2S_RX_WS_IDLE_POL   0: WS is 0 while receiving the left ch
+ *     bit 18  I2S_RX_BIT_ORDER     1: LSB received first, 0: MSB first
+ *
+ *   I2S_RX_CONF1_REG (0x28)
+ *     b 6: 0  I2S_RX_TDM_WS_WIDTH   frame sync lasts (value + 1) * T_bck
+ *     b12: 7  I2S_RX_BCK_DIV_NUM    (not scanned: the clocks are correct)
+ *     b17:13  I2S_RX_BITS_MOD       7/15/23/31 -> 8/16/24/32 bit per slot
+ *     b23:18  I2S_RX_HALF_SAMPLE_BITS   "Rx half sample bits - 1"
+ *     b29     I2S_RX_MSB_SHIFT      1: Philips standard mode
+ *
+ * A candidate is applied, V908_WARM blocks are thrown away so the FIFO is
+ * drained of the previous framing, then V908_MEAS blocks are averaged and
+ * printed -- even when the answer is zero.
+ */
+
+#define V908_KEEP     (-1)
+#define V908_WARM     2u     /* blocks discarded after each candidate     */
+#define V908_MEAS     10u    /* blocks averaged into each lnz figure       */
+#define V908_MAXSCAN  3u     /* hard cap on full scans per boot            */
+
+struct v908_cand_s
+{
+  int16_t msb;   /* I2S_RX_MSB_SHIFT        (conf1 bit29)                */
+  int16_t la;    /* I2S_RX_LEFT_ALIGN       (rxconf bit15)               */
+  int16_t bo;    /* I2S_RX_BIT_ORDER        (rxconf bit18)               */
+  int16_t wp;    /* I2S_RX_WS_IDLE_POL      (rxconf bit17)               */
+  int16_t bm;    /* I2S_RX_BITS_MOD         (conf1 b17:13)               */
+  int16_t hs;    /* I2S_RX_HALF_SAMPLE_BITS (conf1 b23:18)               */
+  int16_t ws;    /* I2S_RX_TDM_WS_WIDTH     (conf1 b6:0)                 */
+};
+
+/* V908_KEEP means "whatever i2s_configure() latched".  It is substituted
+ * from g_v908_base, snapshotted when the scan starts, so a candidate can
+ * never inherit a field that a previous candidate left behind. */
+
+static const struct v908_cand_s g_v908_tab[] =
+{
+  /* A -- pure receiver alignment.  Nothing else moves, so if none of these
+   * eight helps, the loss is not a one-slot alignment bug. */
+  { 1, 0, 0, 0, V908_KEEP, V908_KEEP, V908_KEEP },  /* A0 = V907 baseline */
+  { 1, 0, 1, 0, V908_KEEP, V908_KEEP, V908_KEEP },  /* A1 */
+  { 1, 1, 0, 0, V908_KEEP, V908_KEEP, V908_KEEP },  /* A2 */
+  { 1, 1, 1, 0, V908_KEEP, V908_KEEP, V908_KEEP },  /* A3 */
+  { 0, 0, 0, 0, V908_KEEP, V908_KEEP, V908_KEEP },  /* A4 */
+  { 0, 0, 1, 0, V908_KEEP, V908_KEEP, V908_KEEP },  /* A5 */
+  { 0, 1, 0, 0, V908_KEEP, V908_KEEP, V908_KEEP },  /* A6 */
+  { 0, 1, 1, 0, V908_KEEP, V908_KEEP, V908_KEEP },  /* A7 */
+
+  /* B -- frame-sync polarity: WS inverted with respect to the codec. */
+  { 1, 0, 0, 1, V908_KEEP, V908_KEEP, V908_KEEP },  /* B0 */
+  { 0, 0, 0, 1, V908_KEEP, V908_KEEP, V908_KEEP },  /* B1 */
+
+  /* C -- how many bits per slot are actually sampled. */
+  { 1, 0, 0, 0,  7, V908_KEEP, V908_KEEP },         /* C0 8-bit  */
+  { 1, 0, 0, 0, 23, V908_KEEP, V908_KEEP },         /* C1 24-bit */
+  { 1, 0, 0, 0, 31, V908_KEEP, V908_KEEP },         /* C2 32-bit */
+  { 0, 0, 0, 0,  7, V908_KEEP, V908_KEEP },         /* C3        */
+
+  /* D -- half-sample bits.  The header calls this "Rx half sample bits -1";
+   * ESP-IDF's HAL uses half the slot width while this port latches 15. */
+  { 1, 0, 0, 0, V908_KEEP,  7, V908_KEEP },         /* D0 */
+  { 0, 0, 0, 0, V908_KEEP,  7, V908_KEEP },         /* D1 */
+  { 1, 0, 0, 0, V908_KEEP, 15, V908_KEEP },         /* D2 */
+
+  /* E -- frame-sync width, (value + 1) * T_bck.  15 is what V721b landed;
+   * 0 is the pre-V721b one-bit-clock shape. */
+  { 1, 0, 0, 0, V908_KEEP, V908_KEEP,  0 },         /* E0 */
+  { 0, 0, 0, 0, V908_KEEP, V908_KEEP,  0 },         /* E1 */
+  { 1, 0, 0, 0, V908_KEEP, V908_KEEP, 31 },         /* E2 */
+  { 0, 0, 0, 0, V908_KEEP, V908_KEEP, 31 },         /* E3 */
+
+  /* F -- [V912] the v718 / v721b shape: ws = 15.
+   *
+   * E0 (ws = 0) is what V910 locked, and it was picked by the V909
+   * score, which requires pk >= 4096.  That score systematically
+   * selects full-scale mis-framed garbage (it is the one thing that
+   * always reaches 65535) and rejects real speech -- v721b measured
+   * maxabs 624 on genuine audio and would score ok = 0.  Five-round
+   * winners had an empty intersection, which is noise, not evidence.
+   *
+   * ws = 15 is the only value with a positive measurement behind it:
+   *   [V718]  WS_WIDTH = 15 -> audio, 24 dumps
+   *           WS_WIDTH =  1 -> every word in {ffff,0000,8000}, the
+   *           "fixed digital pattern" chased since v698
+   *   [V721b] conf1 = 0x2f3de38f -> 64/64 dumps real speech
+   * and it is the value the other two writers already use:
+   * i2s_set_datawidth() writes data_width - 1 and i2s_v858_relock()
+   * step 5 writes the literal 15.  Philips wants a half-frame WS,
+   * i.e. (ws + 1) = 16 BCLK for a 32-BCLK frame.
+   *
+   * Runtime contract: conf1 must read 0x2f3de38f at all times. */
+  { 1, 0, 0, 0, V908_KEEP, V908_KEEP, 15 }          /* F0 = v721b */
+};
+
+#define V908_NCAND (sizeof(g_v908_tab) / sizeof(g_v908_tab[0]))
+
+/* [V910] *** Static lock: one candidate, no search. ***
+ *
+ * V909 ran all twenty-one candidates on five independent boots and the
+ * five rounds did not agree.  Per-round winners:
+ *   run1 {#2,#6,#9,#17}  run2 {#4,#13,#17,#20}  run3 {#4,#9,#10}
+ *   run4 {#13,#17,#19}   run5 {#10,#14,#18}
+ * The intersection is empty, so a 3-of-5 showing cannot be told apart
+ * from luck.  #17 was the only candidate that reached 10/10 twice, and
+ * the round it actually won (run4) was also the round where the
+ * application layer came closest to passing: peak median 1023, 774 of
+ * 810 blocks above 1000.
+ *
+ * V909 also quantified something the search itself may have caused:
+ * every round put 6-8 of the 21 candidates into
+ * or = 0x0000 / 0x8000 / 0xc000 / 0xe000 / 0xf000 -- no data at all, or
+ * only the top two or three bits moving, i.e. an RX FIFO that is not
+ * streaming.  The scanner stops and restarts I2S between every
+ * candidate, so a candidate can easily land in the window where the
+ * receiver has not settled yet.  If that is the cause, the dead windows
+ * must disappear once there is a single static configuration and no
+ * restarts.  That is what this build tests.
+ *
+ * Exactly one variable versus V909: RX_TDM_WS_WIDTH 15 -> 0, which is
+ * candidate #17 = { msb=1 la=0 bo=0 wp=0 bm=KEEP hs=KEEP ws=0 }.
+ * Everything else stays at i2s_configure()'s own latches.
+ *
+ * V910_RESCAN 0 also disables the post-lock full-table restart, so after
+ * the measurement there is no further stop/start at all except the
+ * single relock that fires after 32 silent blocks. */
+
+#define V910_LOCK   21u    /* [V912] index of F0 (ws=15) in the table */
+#define V910_RESCAN 0u     /* 0: never re-run the table after a lock */
+
+static struct v908_cand_s g_v908_base;   /* i2s_configure()'s own latches  */
+static struct v908_cand_s g_v908_eff;    /* what the last apply() wrote    */
+static unsigned           g_v908_idx;
+static unsigned           g_v908_phase;  /* 0 to apply, 1 warm, 2 measure  */
+static unsigned           g_v908_blk;
+static unsigned           g_v908_done;
+static unsigned           g_v908_scans;
+static unsigned           g_v908_best;
+static unsigned           g_v908_bestpp; /* per mille                      */
+static unsigned           g_v908_bad;
+static unsigned long      g_v908_blocks;
+static unsigned long      g_v908_seen;
+static uint32_t           g_v908_nz;
+static uint32_t           g_v908_nt;
+
+/* [V909] *** Joint criterion state. ***
+ *
+ * lnz is necessary but not sufficient, so V909 adds the two things that
+ * lnz cannot see: polarity and amplitude.  All four quantities are
+ * accumulated over the V908_MEAS blocks of ONE candidate and reset when
+ * the next candidate is applied, so a candidate can never inherit the
+ * previous one's numbers.
+ *
+ *   g_v909_or   OR of every word of every measured block.  bit15 set
+ *               means at least one word was negative as int16, i.e. the
+ *               stream is bipolar -- real audio always is, a bit-
+ *               reversed or byte-shifted stream never is.
+ *   g_v909_pk   largest unsigned word seen.  Silence, and every framing
+ *               that drops the high byte, sit far below 4096.
+ *   g_v909_ok   blocks passing all three tests at once.
+ *   g_v909_bip  blocks that showed at least one negative word.
+ *
+ * `ok` is the score; the other three are printed too so a candidate that
+ * fails can still be told apart from one that merely fails differently. */
+
+static uint32_t           g_v909_or;
+static uint16_t           g_v909_pk;
+static uint32_t           g_v909_ok;
+static uint32_t           g_v909_bip;
+static uint32_t           g_v909_bestok;
+static uint16_t           g_v909_bestpk;
+static uint32_t           g_v909_bestbip;
+
+/* [V908] Read the seven dimensions exactly as i2s_configure() left them. */
+
+static void i2s_v908_snap(int port)
+{
+  uint32_t c1 = getreg32(I2S_RX_CONF1_REG(port));
+  uint32_t c0 = getreg32(I2S_RX_CONF_REG(port));
+
+  g_v908_base.msb = (int16_t)(((c1 & I2S_RX_MSB_SHIFT_M) != 0u) ? 1 : 0);
+  g_v908_base.la  = (int16_t)(((c0 & I2S_RX_LEFT_ALIGN_M) != 0u) ? 1 : 0);
+  g_v908_base.bo  = (int16_t)(((c0 & I2S_RX_BIT_ORDER_M) != 0u) ? 1 : 0);
+  g_v908_base.wp  = (int16_t)(((c0 & I2S_RX_WS_IDLE_POL_M) != 0u) ? 1 : 0);
+  g_v908_base.bm  = (int16_t)((c1 & I2S_RX_BITS_MOD_M) >>
+                              I2S_RX_BITS_MOD_S);
+  g_v908_base.hs  = (int16_t)((c1 & I2S_RX_HALF_SAMPLE_BITS_M) >>
+                              I2S_RX_HALF_SAMPLE_BITS_S);
+  g_v908_base.ws  = (int16_t)((c1 & I2S_RX_TDM_WS_WIDTH_M) >>
+                              I2S_RX_TDM_WS_WIDTH_S);
+}
+
+/* [V908] Write one candidate.  All seven dimensions are written every time --
+ * either the candidate's value or the baseline snapshot -- so nothing can
+ * survive from the previous candidate.  Nothing outside those seven fields
+ * is touched, and in particular the transmitter is left alone, so BCLK and
+ * WS keep running throughout. */
+
+static void i2s_v908_apply(int port, const struct v908_cand_s *c)
+{
+  uint32_t v;
+  int      spins;
+
+  modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_START, 0);
+
+  /* [V912] *** Reset the receiver, not just its FIFO. ***
+   *
+   * This function used to pulse only I2S_RX_FIFO_RESET (RX_CONF bit1,
+   * "reset Rx AFIFO") and never I2S_RX_RESET (bit0, "Set this bit to
+   * reset receiver").  A FIFO reset drains the buffer but leaves the
+   * receive state machine -- and with it the bit / slot counter --
+   * free-running, so every RX_START re-launch resumed the count at
+   * whatever phase it had reached.  That is the mechanism behind
+   * "k is a different value on every boot" and behind the V911 run2
+   * jump 0xE000 -> 0xFE00 whose boundary lands exactly on a RELOCK.
+   *
+   * i2s_v858_relock() step 2 pulses both, and does it before it
+   * reprograms the framing.  Copied here, so the order matches:
+   *   stop -> update -> reset -> program -> update -> start -> update.
+   *
+   * The extra RX_UPDATE right after the stop is the [V388] handshake
+   * applied to the stop as well: RX_START has to cross into the RX
+   * clock domain before the reset, not after it. */
+
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_UPDATE);
+
+  for (spins = 0;
+       spins < I2S_UPDATE_SPIN_MAX &&
+       (getreg32(I2S_RX_CONF_REG(port)) & I2S_RX_UPDATE);
+       spins++)
+    {
+    }
+
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_RESET);
+  modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_RESET, 0);
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_FIFO_RESET);
+  modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_FIFO_RESET, 0);
+
+  v = (c->la != V908_KEEP) ? (uint32_t)c->la : (uint32_t)g_v908_base.la;
+  g_v908_eff.la = (int16_t)v;
+  modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_LEFT_ALIGN_M,
+              v ? I2S_RX_LEFT_ALIGN : 0);
+
+  v = (c->bo != V908_KEEP) ? (uint32_t)c->bo : (uint32_t)g_v908_base.bo;
+  g_v908_eff.bo = (int16_t)v;
+  modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_BIT_ORDER_M,
+              v ? I2S_RX_BIT_ORDER : 0);
+
+  v = (c->wp != V908_KEEP) ? (uint32_t)c->wp : (uint32_t)g_v908_base.wp;
+  g_v908_eff.wp = (int16_t)v;
+  modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_WS_IDLE_POL_M,
+              v ? I2S_RX_WS_IDLE_POL : 0);
+
+  v = (c->msb != V908_KEEP) ? (uint32_t)c->msb : (uint32_t)g_v908_base.msb;
+  g_v908_eff.msb = (int16_t)v;
+  modifyreg32(I2S_RX_CONF1_REG(port), I2S_RX_MSB_SHIFT_M,
+              v ? I2S_RX_MSB_SHIFT : 0);
+
+  v = (c->bm != V908_KEEP) ? (uint32_t)c->bm : (uint32_t)g_v908_base.bm;
+  g_v908_eff.bm = (int16_t)v;
+  modifyreg32(I2S_RX_CONF1_REG(port), I2S_RX_BITS_MOD_M,
+              FIELD_TO_VALUE(I2S_RX_BITS_MOD, v));
+
+  v = (c->hs != V908_KEEP) ? (uint32_t)c->hs : (uint32_t)g_v908_base.hs;
+  g_v908_eff.hs = (int16_t)v;
+  modifyreg32(I2S_RX_CONF1_REG(port), I2S_RX_HALF_SAMPLE_BITS_M,
+              FIELD_TO_VALUE(I2S_RX_HALF_SAMPLE_BITS, v));
+
+  v = (c->ws != V908_KEEP) ? (uint32_t)c->ws : (uint32_t)g_v908_base.ws;
+  g_v908_eff.ws = (int16_t)v;
+  modifyreg32(I2S_RX_CONF1_REG(port), I2S_RX_TDM_WS_WIDTH_M,
+              FIELD_TO_VALUE(I2S_RX_TDM_WS_WIDTH, v));
+
+  /* rx_update handshake on BOTH sides of rx_start, the way [V388] insists.
+   * [V912] the resets moved above, ahead of the seven fields. */
+
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_UPDATE);
+
+  for (spins = 0;
+       spins < I2S_UPDATE_SPIN_MAX &&
+       (getreg32(I2S_RX_CONF_REG(port)) & I2S_RX_UPDATE);
+       spins++)
+    {
+    }
+
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_START);
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_UPDATE);
+
+  for (spins = 0;
+       spins < I2S_UPDATE_SPIN_MAX &&
+       (getreg32(I2S_RX_CONF_REG(port)) & I2S_RX_UPDATE);
+       spins++)
+    {
+    }
+}
+
+/* [V908] End of the table: lock whatever scored highest. */
+
+static void i2s_v908_finish(int port)
+{
+  g_v908_done  = 1u;
+  g_v908_phase = 0u;
+  g_v908_bad   = 0u;
+  g_v908_scans++;
+
+  i2s_v908_apply(port, &g_v908_tab[g_v908_best]);
+
+  V1024S(LOG_INFO, "[V909]] BEST #%u ok=%u/%u pk=%u bip=%u/%u msb=%d la=%d bo=%d "
+         "wp=%d bm=%d hs=%d ws=%d conf1=0x%08x rxconf=0x%08x\n",
+         g_v908_best, (unsigned)g_v909_bestok, V908_MEAS,
+         (unsigned)g_v909_bestpk, (unsigned)g_v909_bestbip, V908_MEAS,
+         (int)g_v908_eff.msb, (int)g_v908_eff.la, (int)g_v908_eff.bo,
+         (int)g_v908_eff.wp, (int)g_v908_eff.bm, (int)g_v908_eff.hs,
+         (int)g_v908_eff.ws,
+         (unsigned)getreg32(I2S_RX_CONF1_REG(port)),
+         (unsigned)getreg32(I2S_RX_CONF_REG(port)));
+
+  V1024S(LOG_INFO, "[V908]] BEST #%u lnz=%u.%u%% msb=%d la=%d bo=%d wp=%d bm=%d "
+         "hs=%d ws=%d conf1=0x%08x rxconf=0x%08x\n",
+         g_v908_best, g_v908_bestpp / 10u, g_v908_bestpp % 10u,
+         (int)g_v908_eff.msb, (int)g_v908_eff.la, (int)g_v908_eff.bo,
+         (int)g_v908_eff.wp, (int)g_v908_eff.bm, (int)g_v908_eff.hs,
+         (int)g_v908_eff.ws,
+         (unsigned)getreg32(I2S_RX_CONF1_REG(port)),
+         (unsigned)getreg32(I2S_RX_CONF_REG(port)));
+}
+
+/* [V908] One delivered block.  nz / nt is that block's own low-byte-non-zero
+ * count and sample count, measured before de-interleaving and before any
+ * shift, exactly the way [V907] does it. */
+
+static void i2s_v908_block(int port, uint32_t nz, uint32_t nt,
+                           uint32_t bor, uint16_t pk)
+{
+  const struct v908_cand_s *c;
+  unsigned                  pp;
+  unsigned                  v909ok;
+
+  g_v908_blocks++;
+  pp = nt ? (unsigned)((nz * 1000u) / nt) : 0u;
+
+  /* [V909] The joint verdict on THIS block.  Deliberately kept to
+   * three tests that a wrong framing cannot satisfy by accident:
+   *
+   *   (a) nz * 10 >= nt * 9        lnz >= 90%, low byte is moving
+   *   (b) (bor & 0x8000) != 0      a negative word exists: bipolar
+   *   (c) pk >= 4096               amplitude >= 1/8 full scale
+   *
+   * (b) is the one that kills #1.  Bit order reversed puts the sign
+   * bit in bit0, so no word is ever negative and (b) is false even
+   * though (a) reads 99%.  (c) kills the framings that deliver only
+   * the top byte of each sample. */
+
+  v909ok = ((nt > 0u) &&
+            ((nz * 10u) >= (nt * 9u)) &&
+            ((bor & 0x8000u) != 0u) &&
+            ((unsigned)pk >= 4096u)) ? 1u : 0u;
+
+  if (g_v908_done)
+    {
+      /* Post-lock watchdog.  Any later i2s_configure() rewrites all seven
+       * of these fields, so "locked" only holds until the next one; re-apply
+       * BEST once the line goes quiet again, and only re-scan if even that
+       * does not bring it back. */
+
+      if (pp < 50u)
+        {
+          g_v908_bad++;
+
+          if (g_v908_bad == 32u)
+            {
+              /* [V912] *** Deliberately NOT re-running apply(). ***
+               *
+               * V911 run2 pinned it: n=169 pk=57344 (0xE000, p=14) is
+               * followed by [V908] RELOCK #17 and then n=170 pk=65024
+               * (0xFE00, p=10).  The only thing that happened in
+               * between is this stop/start handshake, so every quiet
+               * spell was re-throwing the RX bit phase.  With RX_RESET
+               * now in place the handshake is at least deterministic,
+               * but there is still no reason to disturb a receiver
+               * that has already locked -- silence is a property of
+               * the room, not of the framing.  Keep the message (retagged)
+               * so a silent spell is still visible in the log. */
+
+              V1024S(LOG_INFO, "[V912]] silence #%u after %u blocks: "
+                     "relock suppressed\n",
+                     g_v908_best, g_v908_bad);
+            }
+          else if (g_v908_bad == 160u && g_v908_scans < V908_MAXSCAN
+                   && V910_RESCAN)   /* [V910] no re-scan after a lock */
+            {
+              V1024S(LOG_INFO, "[V908]] RESTART pass #%u\n",
+                     g_v908_scans + 1u);
+              g_v908_done   = 0u;
+              g_v908_phase  = 0u;
+              g_v908_idx    = 0u;
+              g_v908_best   = 0u;
+              g_v908_bestpp = 0u;
+              g_v908_bad    = 0u;
+              g_v908_nz     = 0u;
+              g_v908_nt     = 0u;
+              g_v909_or     = 0u;   /* [V909] */
+              g_v909_pk     = 0u;
+              g_v909_ok     = 0u;
+              g_v909_bip    = 0u;
+              g_v909_bestok  = 0u;
+              g_v909_bestpk  = 0u;
+              g_v909_bestbip = 0u;
+            }
+        }
+      else
+        {
+          g_v908_bad = 0u;
+        }
+
+      return;
+    }
+
+  if (g_v908_scans >= V908_MAXSCAN)
+    {
+      return;
+    }
+
+  switch (g_v908_phase)
+    {
+      case 0:
+        if (g_v908_idx == 0u)
+          {
+            i2s_v908_snap(port);
+            g_v908_best   = 0u;
+            g_v908_bestpp = 0u;
+            g_v909_bestok  = 0u;  /* [V909] */
+            g_v909_bestpk  = 0u;
+            g_v909_bestbip = 0u;
+
+            /* [V910] Skip the table: measure #17 and nothing else.
+             * Setting best as well as idx is what removes the tie-break.
+             * V909's rule was "ok strictly greater, else pk strictly
+             * greater", so a candidate scoring ok=0 pk=0 could never
+             * displace the initial best and finish() would re-apply #0
+             * instead of the candidate that was actually measured. */
+
+            g_v908_idx  = V910_LOCK;
+            g_v908_best = V910_LOCK;
+
+            V1024S(LOG_INFO, "[V910]] LOCK static candidate #%u ws=%d rescan=%u\n",
+                   (unsigned)V910_LOCK, (int)g_v908_tab[V910_LOCK].ws,
+                   (unsigned)V910_RESCAN);
+
+            V1024S(LOG_INFO, "[V908]] BASE msb=%d la=%d bo=%d wp=%d bm=%d hs=%d "
+                   "ws=%d conf1=0x%08x rxconf=0x%08x\n",
+                   (int)g_v908_base.msb, (int)g_v908_base.la,
+                   (int)g_v908_base.bo, (int)g_v908_base.wp,
+                   (int)g_v908_base.bm, (int)g_v908_base.hs,
+                   (int)g_v908_base.ws,
+                   (unsigned)getreg32(I2S_RX_CONF1_REG(port)),
+                   (unsigned)getreg32(I2S_RX_CONF_REG(port)));
+          }
+
+        c = &g_v908_tab[g_v908_idx];
+        i2s_v908_apply(port, c);
+
+        g_v908_seen = g_v908_blocks;
+        g_v908_blk  = 0u;
+        g_v908_nz   = 0u;
+        g_v908_nt   = 0u;
+        g_v909_or   = 0u;   /* [V909] */
+        g_v909_pk   = 0u;
+        g_v909_ok   = 0u;
+        g_v909_bip  = 0u;
+        g_v908_phase = 1u;
+
+        V1024S(LOG_INFO, "[V908]] APPLY #%u msb=%d la=%d bo=%d wp=%d bm=%d hs=%d "
+               "ws=%d\n",
+               g_v908_idx,
+               (int)g_v908_eff.msb, (int)g_v908_eff.la,
+               (int)g_v908_eff.bo, (int)g_v908_eff.wp,
+               (int)g_v908_eff.bm, (int)g_v908_eff.hs,
+               (int)g_v908_eff.ws);
+        break;
+
+      case 1:
+        g_v908_blk++;
+
+        if (g_v908_blk >= V908_WARM)
+          {
+            g_v908_blk   = 0u;
+            g_v908_phase = 2u;
+          }
+
+        break;
+
+      default:
+        /* [V909] Fold this block into the candidate's joint score.
+         * The per-block line is printed too: V908 showed that the
+         * delivered data is non-stationary, and a 10-block average
+         * hides whether a candidate was steady or merely lucky. */
+
+        g_v909_or |= bor;
+
+        if (pk > g_v909_pk)
+          {
+            g_v909_pk = pk;
+          }
+
+        if ((bor & 0x8000u) != 0u)
+          {
+            g_v909_bip++;
+          }
+
+        g_v909_ok += v909ok;
+
+        V1024S(LOG_INFO, "[V909]] blk #%u %u/%u lnz=%u%% or=0x%04x pk=%u ok=%u\n",
+               g_v908_idx, g_v908_blk + 1u, V908_MEAS,
+               pp / 10u, (unsigned)bor, (unsigned)pk, v909ok);
+
+        g_v908_nz += nz;
+        g_v908_nt += nt;
+        g_v908_blk++;
+
+        if (g_v908_blk >= V908_MEAS)
+          {
+            pp = g_v908_nt ?
+                 (unsigned)((g_v908_nz * 1000u) / g_v908_nt) : 0u;
+
+            V1024S(LOG_INFO, "[V908]] SCAN #%u msb=%d la=%d bo=%d wp=%d bm=%d hs=%d "
+                   "ws=%d lnz=%u.%u%% nz=%u ntot=%u conf1=0x%08x "
+                   "rxconf=0x%08x\n",
+                   g_v908_idx,
+                   (int)g_v908_eff.msb, (int)g_v908_eff.la,
+                   (int)g_v908_eff.bo, (int)g_v908_eff.wp,
+                   (int)g_v908_eff.bm, (int)g_v908_eff.hs,
+                   (int)g_v908_eff.ws,
+                   pp / 10u, pp % 10u,
+                   (unsigned)g_v908_nz, (unsigned)g_v908_nt,
+                   (unsigned)getreg32(I2S_RX_CONF1_REG(port)),
+                   (unsigned)getreg32(I2S_RX_CONF_REG(port)));
+
+            /* [V909] The score that decides the winner: how many of
+             * the ten blocks passed all three tests.  pk is the
+             * tie-break so that, between two candidates with the
+             * same count, the louder one wins. */
+
+            V1024S(LOG_INFO, "[V909]] SCAN #%u msb=%d la=%d bo=%d wp=%d bm=%d "
+                   "hs=%d ws=%d ok=%u/%u lnz=%u.%u%% or=0x%08x pk=%u "
+                   "bip=%u/%u\n",
+                   g_v908_idx,
+                   (int)g_v908_eff.msb, (int)g_v908_eff.la,
+                   (int)g_v908_eff.bo, (int)g_v908_eff.wp,
+                   (int)g_v908_eff.bm, (int)g_v908_eff.hs,
+                   (int)g_v908_eff.ws,
+                   (unsigned)g_v909_ok, V908_MEAS,
+                   pp / 10u, pp % 10u,
+                   (unsigned)g_v909_or, (unsigned)g_v909_pk,
+                   (unsigned)g_v909_bip, V908_MEAS);
+
+            if (g_v908_idx == 0u ||
+                g_v909_ok > g_v909_bestok ||
+                (g_v909_ok == g_v909_bestok &&
+                 (unsigned)g_v909_pk > (unsigned)g_v909_bestpk))
+              {
+                g_v908_bestpp = pp;
+                g_v908_best   = g_v908_idx;
+                g_v909_bestok = g_v909_ok;
+                g_v909_bestpk = g_v909_pk;
+                g_v909_bestbip = g_v909_bip;
+              }
+
+            g_v908_idx++;
+
+            g_v908_idx = (unsigned)V908_NCAND;   /* [V910] one candidate */
+
+            if (g_v908_idx >= (unsigned)V908_NCAND)
+              {
+                i2s_v908_finish(port);
+              }
+            else
+              {
+                g_v908_phase = 0u;
+              }
+          }
+
+        break;
+    }
+}
+
+/* [V908] Starvation guard, called once per capture session right after the
+ * V858 relock.  A candidate that silences the receiver therefore costs one
+ * listening session instead of the whole boot.  The relock has just put all
+ * seven fields back to baseline, so when delivery is healthy we simply
+ * re-run the current candidate rather than trusting the blocks measured
+ * since. */
+
+static void i2s_v908_tick(int port)
+{
+  if (g_v908_done || g_v908_scans >= V908_MAXSCAN || g_v908_phase == 0u)
+    {
+      return;
+    }
+
+  if (g_v908_blocks == g_v908_seen)
+    {
+      V1024S(LOG_INFO, "[V908]] SCAN #%u TIMEOUT phase=%u blocks=%u conf1=0x%08x\n",
+             g_v908_idx, g_v908_phase, g_v908_blk,
+             (unsigned)getreg32(I2S_RX_CONF1_REG(port)));
+
+      g_v908_idx++;
+
+      if (g_v908_idx >= (unsigned)V908_NCAND)
+        {
+          i2s_v908_finish(port);
+        }
+      else
+        {
+          g_v908_phase = 0u;
+        }
+    }
+  else
+    {
+      g_v908_seen   = g_v908_blocks;
+      g_v908_phase  = 0u;
+      g_v908_blk    = 0u;
+      g_v908_nz     = 0u;
+      g_v908_nt     = 0u;
+      g_v909_or     = 0u;   /* [V909] */
+      g_v909_pk     = 0u;
+      g_v909_ok     = 0u;
+      g_v909_bip    = 0u;
+    }
+}
+
 static void i2s_rx_worker(void *arg)
 {
   struct esp32s3_i2s_s *priv = (struct esp32s3_i2s_s *)arg;
@@ -2562,6 +4185,24 @@ static void i2s_rx_worker(void *arg)
   irqstate_t flags;
 
   DEBUGASSERT(priv);
+
+  /* [V691] Keep the frame clock on the pads for the whole capture, and take
+   * a late pin snapshot once the stream has settled.  Every previous
+   * [V660] pins line came from the capture-start probe, i.e. before the
+   * engines were up, which is why they all read rxstart=0 and BCLK=0. */
+
+  i2s_v691_clock_ensure(priv, 1);
+
+  {
+    static unsigned int s_v691_n;
+
+    s_v691_n++;
+
+    if (s_v691_n == 4 || s_v691_n == 24 || s_v691_n == 64)
+      {
+        esp32s3_i2s_rx_health();
+      }
+  }
 
   /* When the transfer was started, the active buffer containers were removed
    * from the rx.pend queue and saved in the rx.act queue. We get here when
@@ -2591,15 +4232,188 @@ static void i2s_rx_worker(void *arg)
 
       dmadesc = bfcontainer->dma_link;
 
+      
+
       bfcontainer->apb->nbytes = 0;
+
+      /* [V689] Sum SIZE (ctrl[11:0]), not DATALEN (ctrl[23:12]).
+       *
+       * The V688 one-shot dump captured a completed RX descriptor as
+       *     d0 = 0x407feffc
+       *   OWN    (bit31)   = 0            released by the DMA
+       *   EOF    (bit30)   = 1            suc_eof landed on this one
+       *   LENGTH ([23:12]) = 0x7fe = 2046
+       *   SIZE   ([11:0])  = 0xffc = 4092 <- bytes the hardware received
+       *
+       * So the DMA had already stored the WHOLE 4092-byte buffer (the V688
+       * single-descriptor / EOF-threshold change worked), but
+       * ESP32S3_DMA_CTRL_DATALEN_S is 12, i.e. the old walk summed LENGTH
+       * and reported 2046, after which i2s_rx_worker() memcpy'd only 2046
+       * of the 4092 bytes: half of every capture buffer was discarded.
+       *
+       * The RX received-byte count lives in SIZE, i.e.
+       * ESP32S3_DMA_CTRL_BUFLEN_S (0).  This walk is the only one, so TX
+       * is untouched. */
 
       while (dmadesc != NULL && (dmadesc->ctrl & ESP32S3_DMA_CTRL_EOF))
         {
+          /* [V690] DATA LENGTH, not the programmed buffer SIZE.
+           *
+           * arch/xtensa/src/esp32s3/esp32s3_dma.c:315 --
+           *   "Only set Data Length if it's a TX buffer. Otherwise, it
+           *    will be written automatically by hardware."
+           * So on RX the hardware owns ctrl[23:12] (DATALEN) and software
+           * owns ctrl[11:0] (BUFLEN/SIZE).  v689 summed SIZE, which is the
+           * constant 4092 we programmed, so every completion looked full and
+           * the worker memcpy'd 4092 bytes out of a bounce slot of which
+           * only DATALEN were ever written by the DMA -- the app then read
+           * stale bytes from the previous arm as if they were audio.
+           * Measured with the v689 d0 dump: 0x407feffc -> SIZE 4092,
+           * LENGTH 2046. */
+
           bfcontainer->apb->nbytes +=
               (dmadesc->ctrl >> ESP32S3_DMA_CTRL_DATALEN_S) &
               ESP32S3_DMA_CTRL_DATALEN_V;
           dmadesc = dmadesc->next;
         }
+
+      /* [V688] Descriptor forensics, first 8 RX buffers only.
+       *
+       * v687 reported "chunk#1: 2044 bytes" from a threshold of 2044,
+       * whose "counts bits" reading would be 2 * (2044 + 1) = 4090 bytes.
+       * The walk therefore yields exactly the threshold value, which fits
+       * "I2S_RX_EOF_NUM counts BYTES" (trigger 2045) but not "counts
+       * bits".  Reading the raw control words back settles it:
+       *   ctrl[11:0]  SIZE   (RX: written by hardware = bytes received)
+       *   ctrl[23:12] LENGTH
+       *   ctrl[30]    EOF (suc_eof)
+       *   ctrl[31]    OWN
+       * A second line with the re-armed threshold follows on the next
+       * arm, so one press is enough.
+       */
+
+      {
+        static unsigned s_v688_dump;
+
+        if (s_v688_dump < 8u)
+          {
+#if I2S_DMADESC_NUM >= 2
+            uint32_t d1 = (uint32_t)bfcontainer->dma_link[1].ctrl;
+#else
+            uint32_t d1 = 0u;
+#endif
+            s_v688_dump++;
+
+            V1024S(LOG_INFO, "[V688]] nb=%u walk=%u d0=0x%08x d1=0x%08x\n",
+                   (unsigned)bfcontainer->nbytes,
+                   (unsigned)bfcontainer->apb->nbytes,
+                   (unsigned)bfcontainer->dma_link[0].ctrl,
+                   (unsigned)d1);
+          }
+      }
+
+      /* [V912] *** RX liveness snapshot. ***
+       *
+       * Pure observation, every 32nd delivery -- one line per buffer
+       * would be four times the [V877] volume that panicked inside
+       * vsyslog, so it is sampled.
+       *
+       * What separates the two failure modes:
+       *   iraw bit2  I2S_RX_HUNG_INT_RAW  1 = the receiver itself has
+       *              been declared hung; 0 while words still arrive
+       *              (even constant ones) = the pipe runs, the phase
+       *              does not.
+       *   fifo       GDMA INFIFO byte count.  Rising = I2S is still
+       *              filling it.  Constant 0 = nothing is coming out.
+       *   dstat      GDMA IN_STATE + the current descriptor address.
+       *              Changing = the DMA is walking the ring.
+       *   d0 / d1    descriptor ctrl words: bit31 OWN (1 = still held
+       *              by the DMA), bit30 EOF (suc_eof landed here),
+       *              [23:12] LENGTH, [11:0] SIZE = bytes received.
+       *
+       * A frozen constant stream with hung=0, a moving fifo and a
+       * moving dstat is a phase fault, which is what V912 is fixing.
+       * Anything else points at the DMA / inlink instead. */
+
+      {
+        static unsigned s_v912_st;
+        int             v912p = (int)priv->config->port;
+
+        if ((s_v912_st++ % 32u) == 0u)
+          {
+            uint32_t v912iraw = getreg32(I2S_INT_RAW_REG(v912p));
+
+            /* [V913] *** Is `hung` sticky or continuous? ***
+             *
+             * I2S_RX_HUNG_INT_RAW is INT_RAW bit2, WTC (write-one-
+             * to-clear).  V912 read it 62 times and got 1 every
+             * time, with INT_ST = 0 throughout (the enable is not
+             * set, so it never reaches the CPU).  Nothing in this
+             * tree ever wrote I2S_INT_CLR_REG, so the bit is a
+             * latch that has been stuck at 1 since the first time
+             * the condition fired -- which might be a one-off at
+             * bring-up or might be true right now.  A bit that is
+             * always 1 cannot tell those apart and carries no
+             * information.
+             *
+             * Clear it and read it back in the same snapshot:
+             *   iraw  = the accumulated (pre-clear) state, kept
+             *           verbatim so V912 logs stay comparable;
+             *   post  = what the hardware says NOW, ~32 buffers
+             *           after the previous snapshot.
+             *
+             *   post bit2 = 0 forever  -> latched once at boot,
+             *           the receiver is not hung, ignore it;
+             *   post bit2 = 1 again    -> re-asserted inside one
+             *           sampling window, the receiver really is
+             *           hanging and that is a live fault.
+             *
+             * Only bit2 is cleared: the other INT_RAW bits are the
+             * same kind of latch and there is no reason to erase
+             * them from under the other diagnostics. */
+
+            putreg32(I2S_RX_HUNG_INT_RAW, I2S_INT_CLR_REG(v912p));
+
+            {
+              uint32_t v913post = getreg32(I2S_INT_RAW_REG(v912p));
+
+              V1024S(LOG_INFO, "[V913]] HUNG n=%u pre=0x%08x post=0x%08x "
+                     "phung=%u\n",
+                     s_v912_st - 1u,
+                     (unsigned)v912iraw,
+                     (unsigned)v913post,
+                     (unsigned)((v913post & I2S_RX_HUNG_INT_RAW) ?
+                                1u : 0u));
+            }
+#if I2S_DMADESC_NUM >= 2
+            uint32_t v912d1   = (uint32_t)bfcontainer->dma_link[1].ctrl;
+#else
+            uint32_t v912d1   = 0u;
+#endif
+
+            V1024S(LOG_INFO, "[V912]] ST n=%u iraw=0x%08x hung=%u ist=0x%08x "
+                   "state=0x%08x\n",
+                   s_v912_st - 1u,
+                   (unsigned)v912iraw,
+                   (unsigned)((v912iraw & I2S_RX_HUNG_INT_RAW) ? 1u : 0u),
+                   (unsigned)getreg32(I2S_INT_ST_REG(v912p)),
+                   (unsigned)getreg32(I2S_STATE_REG(v912p)));
+
+            V1024S(LOG_INFO, "[V912]] DMA n=%u dira=0x%08x fifo=0x%08x "
+                   "dstat=0x%08x dlink=0x%08x d0=0x%08x d1=0x%08x\n",
+                   s_v912_st - 1u,
+                   (unsigned)GET_GDMA_CH_REG(DMA_IN_INT_RAW_CH0_REG,
+                                             priv->dma_channel),
+                   (unsigned)GET_GDMA_CH_REG(DMA_INFIFO_STATUS_CH0_REG,
+                                             priv->dma_channel),
+                   (unsigned)GET_GDMA_CH_REG(DMA_IN_STATE_CH0_REG,
+                                             priv->dma_channel),
+                   (unsigned)GET_GDMA_CH_REG(DMA_IN_LINK_CH0_REG,
+                                             priv->dma_channel),
+                   (unsigned)bfcontainer->dma_link[0].ctrl,
+                   (unsigned)v912d1);
+          }
+      }
 
       /* [V307][RXBOUNCE] DMA landed in the internal-SRAM bounce slot;
        * deliver the received bytes to the real (PSRAM) apb payload and
@@ -2614,7 +4428,776 @@ static void i2s_rx_worker(void *arg)
               ncopy = bfcontainer->apb->nmaxbytes;
             }
 
-          memcpy(bfcontainer->apb->samp, bfcontainer->buf, ncopy);
+          
+          /* [V707] De-interleave the two-slot RX frame.
+           *
+           * The RX engine runs with TOT_CHAN_NUM = 1, i.e. a TWO-slot
+           * frame, because that is what keeps BCLK at 32 x fs for the
+           * ES8311.  ES8311 is mono, so only one slot carries audio and
+           * the other is all zeros.  The v706 field capture shows 79 zero
+           * samples for every 7 real ones, with a live sequence of
+           *
+           *   fffa 7fff 0000 fbaa 0000 fd8a 0000 006c 0000 01a4 0000 0306
+           *        ^samp      ^0        ^0        ^0        ^0
+           *
+           * Handed to a 16 kHz consumer that sounds half speed and
+           * hollow, which no ASR can read.
+           *
+           * DATALEN is 2046, not a multiple of 4, so which slot is live
+           * flips parity from buffer to buffer -- measure the energy of
+           * each parity and keep the louder half rather than assuming
+           * one.  Zero padding has no energy, so this is unambiguous.
+           *
+           * Note the memcpy that used to follow is gone: the loop below
+           * writes the compacted samples straight into apb->samp, and
+           * re-copying from buf would undo the work.
+           */
+          {
+            const uint8_t *v707s = (const uint8_t *)bfcontainer->buf;
+            uint32_t v707n = ncopy / 2u;
+            uint32_t v707i;
+            uint32_t v707w = 0u;
+            uint32_t v707e0 = 0u;
+            uint32_t v707e1 = 0u;
+            int      v707deint;
+
+            /* [V709] Runtime de-interleave switch.
+             *
+             * Default is the v707 behaviour (OFF is not the default), so
+             * this build is a drop-in for v707.  /tmp/deint.txt whose
+             * first character is '0' turns the de-interleave off for the
+             * next delivered buffer; the loop below then walks every word
+             * instead of every other one, which is byte-for-byte the
+             * pre-v707 memcpy(result, buf, ncopy).  Any other content, or
+             * no file at all, leaves it on.  Re-read every 32 buffers, so
+             * an A/B test needs no reflash.
+             *
+             * Why this matters: v707 pinned the MIC PGA at step 0 -- the
+             * [V660] reg10 dump reads back "1f 7f 00 10 1a 40 04 bf",
+             * i.e. 0x16 = 0x04 -- yet the samples are still the full-scale
+             * square wave that the v706 "16 04" experiment had cured.
+             * The v706 logs disagree in exactly one way:
+             *
+             *   _v706_slotL  fffa 7fff | 0000 fbaa | 0000 fd8a ...
+             *                even words zero, odd words audio -> clean
+             *   _v706_slotb  fffa 0000 | 6000 7fff | 8000 8000 ...
+             *                both words full scale            -> square
+             *   v707         output 8000 0000 | 7fff 8000 | 7fff 6000
+             *                the slotb shape
+             *
+             * _v706_slotb ran rxslot = 0x03; v707 prints rxslot = 0x01
+             * and still yields the slotb shape, so either that print shows
+             * a software variable rather than the register, or something
+             * rewrites I2S_RX_TDM_CTRL after i2s_rxdma_start() programmed
+             * it.  The B3 dump reads the register at delivery time.
+             */
+            {
+              static unsigned v709tick;
+
+              /* [V717] Default is now OFF.  Measured on v716: with
+               * /tmp/deint.txt = 0 the application received 417384 bytes
+               * per session instead of 197440 -- 2.11x -- and each chunk
+               * went from 1022 to 2046 bytes.  The receiver hands over
+               * about one 16-bit word per audio frame (33,900 B/s raw =
+               * 16,950 words/s, tdm=0x00010001 enables only CHAN0), so the
+               * stream is already mono; taking every other word is plain
+               * 2:1 decimation of ~17 kHz down to 8.5 kHz.  e0=8478720
+               * against e1=8192000 confirms both parities carry the same
+               * energy, i.e. it is one continuous stream and not the
+               * "one slot audio, one slot zero" case the parity picker was
+               * written for.
+               *
+               * This fixes the rate only.  The content is still not audio
+               * (peak stays 6 with the de-interleave off), so the alignment
+               * question is still open -- do not read one as the other. */
+
+              static int      v709on = 0;
+
+              if ((v709tick++ & 31u) == 0u)
+                {
+                  FILE *v709f = fopen("/tmp/deint.txt", "r");
+
+                  if (v709f != NULL)
+                    {
+                      v709on = (fgetc(v709f) == '0') ? 0 : 1;
+                      fclose(v709f);
+                    }
+
+                  /* [V718] No file: KEEP the current value.  The old
+                   * `else { v709on = 1; }` re-asserted 1 every 32 buffers,
+                   * which is why v717's default-0 initialiser had no effect
+                   * and v717b still logged deint=1 in every dump.
+                   *
+                   * OFF is right here.  One 16-bit word arrives per frame
+                   * (33,900 B/s raw over 16.86 buffers/s = 17.25 k words/s,
+                   * and tdm=0x00010001 enables CHAN0 only), so the stream is
+                   * already mono at ~16 kHz; stepping by two is a plain 2:1
+                   * decimation to 8 kHz.  e0 = 8478720 against e1 = 8192000
+                   * says both parities carry the same energy, i.e. one
+                   * continuous stream, not the one-slot-audio case the
+                   * parity picker was written for. */
+                }
+
+              v707deint = v709on;
+            }
+
+            for (v707i = 0u; v707i < v707n; v707i++)
+              {
+                uint16_t v707u = (uint16_t)((uint16_t)v707s[v707i * 2u] |
+                                  ((uint16_t)v707s[v707i * 2u + 1u] << 8));
+                uint16_t v707a = (v707u & 0x8000u) ?
+                                 (uint16_t)(~v707u + 1u) : v707u;
+
+                if (v707i & 1u) { v707e1 += v707a; }
+                else            { v707e0 += v707a; }
+              }
+
+            /* [V709] deint on  -> start on the louder parity, step 2.
+             *        deint off -> start at 0, step 1, i.e. every word.
+             */
+
+            for (v707i = v707deint ? ((v707e1 >= v707e0) ? 1u : 0u) : 0u;
+                 v707i < v707n;
+                 v707i += v707deint ? 2u : 1u)
+              {
+                memcpy((uint8_t *)bfcontainer->apb->samp + v707w,
+                       v707s + v707i * 2u, 2u);
+                v707w += 2u;
+              }
+
+            ncopy = v707w;
+
+            /* [V709] Forensics for the first three buffers after boot: the
+             * raw frame as the DMA delivered it, the frame handed to the
+             * upper half, the parity energies and the live TDM/clock
+             * registers.  Reading the register here -- not in the health
+             * helper -- is what tells whether arm-time programming
+             * survives to data time.
+             */
+
+            {
+              static unsigned      v709dump;
+              static int           v709arm;
+              static unsigned      v709gen;
+              static unsigned long v716bufs;
+              static unsigned long v716bytes;
+              uint32_t v716or = 0u;
+              uint16_t v716pk = 0u;
+              uint16_t v716mn = 0xffffu;
+              uint32_t v716k;
+
+              /* [V716] Re-armable: the one-shot dump used to stop after the
+               * first three buffers of boot, which is useless for a sweep.
+               * Touching /tmp/v709dump.txt arms it for the next 24. */
+
+              {
+                FILE *v716a = fopen("/tmp/v709dump.txt", "r");
+
+                if (v716a != NULL)
+                  {
+                    fclose(v716a);
+                    v709dump = 0u;
+                    v709arm  = 1;
+                  }
+
+                /* [V717] Also re-arm on every configure generation, so each
+                 * profile in the sweep table gets its own raw frame without
+                 * anything having to be installed by hand. */
+
+                if (v709gen != g_v717_gen)
+                  {
+                    v709gen  = g_v717_gen;
+                    v709dump = 0u;
+                    v709arm  = 1;
+                  }
+              }
+
+              v716bufs++;
+              v716bytes += (unsigned long)v707n * 2u;
+
+              for (v716k = 0u; v716k < v707n; v716k++)
+                {
+                  uint16_t v716u = (uint16_t)((uint16_t)v707s[v716k * 2u] |
+                                    ((uint16_t)v707s[v716k * 2u + 1u] << 8));
+
+                  v716or |= (uint32_t)v716u;
+
+                  if (v716u > v716pk) { v716pk = v716u; }
+                  if (v716u < v716mn) { v716mn = v716u; }
+                }
+
+              /* [V907] *** Per-buffer low-byte-non-zero ratio (lnz). ***
+               *
+               * `or` / `lowzero` turned out to be a run-to-run drift
+               * quantity -- V903 0xfe00, V904 0xff00, V905 0xfc00, and V906
+               * gave 0xff00 / 0xff00+0xfffc / 0xff00+0xfc00 on three boots
+               * of ONE firmware -- so no cross-version comparison made with
+               * them means anything.  lnz is a ratio inside a single
+               * buffer and therefore has nothing to drift:
+               *
+               *   lnz = (samples whose low 8 bits are non-zero) / v707n
+               *
+               * Genuine 16-bit audio: > 90%.  The failure mode -- every
+               * delivered word reads 0xNN00 -- gives exactly 0.0%.
+               *
+               * Counted for THIS BUFFER ONLY, never accumulated.  A parity
+               * that alternates from buffer to buffer sums to the same
+               * total on both sides, which is precisely how a running
+               * tally misled v717/v718 (see the [V905] P block below).
+               * v707n is the sample count of this delivery
+               * (ncopy / 2, esp32s3_i2s.c:3578) and v707s is the raw DMA
+               * buffer, so this is measured before v707 de-interleaves and
+               * before [V733] shifts anything. */
+              {
+                uint32_t v907nz = 0u;
+                uint32_t v907k;
+
+                for (v907k = 0u; v907k < v707n; v907k++)
+                  {
+                    uint16_t v907u = (uint16_t)((uint16_t)v707s[v907k * 2u] |
+                                     ((uint16_t)v707s[v907k * 2u + 1u] << 8));
+
+                    if ((v907u & 0x00ffu) != 0u)
+                      {
+                        v907nz++;
+                      }
+                  }
+
+                if (v707n > 0u)
+                  {
+                    /* [V926] Silenced: this fires once per RX block, and the
+                     * capture pipeline is only 2 x 128 ms deep, so the reader
+                     * thread must never linger.  Flip back to (1) to re-enable
+                     * the low-byte-non-zero tally. */
+                    if (0)
+                    {
+                    V1024S(LOG_INFO, "[V907]] n=%u lnz=%u.%u%% nz=%u ntot=%u pk=%d mn=%d\n",
+                           (unsigned)v716bufs,
+                           (unsigned)((v907nz * 100u) / v707n),
+                           (unsigned)(((v907nz * 1000u) / v707n) % 10u),
+                           (unsigned)v907nz, (unsigned)v707n,
+                           (int)v716pk, (int)v716mn);
+                    }
+                  }
+              }
+
+              /* [V908] Feed this block's low-byte-non-zero ratio to the
+               * alignment scanner.  Recomputed here rather than lifted out
+               * of the [V907] block so that V908 stays a pure insertion:
+               * ncopy is gone by now if the de-interleave ran, so this uses
+               * the same v707s / v707n the [V907] tally uses, i.e. the raw
+               * DMA words before any shifting. */
+
+              {
+                uint32_t v908nz = 0u;
+                uint32_t v908k;
+
+                for (v908k = 0u; v908k < v707n; v908k++)
+                  {
+                    uint16_t v908u = (uint16_t)((uint16_t)v707s[v908k * 2u] |
+                                     ((uint16_t)v707s[v908k * 2u + 1u] << 8));
+
+                    if ((v908u & 0x00ffu) != 0u)
+                      {
+                        v908nz++;
+                      }
+                  }
+
+                if (v707n > 0u)
+                  {
+                    i2s_v908_block((int)priv->config->port, v908nz,
+                                  v707n, (uint32_t)v716or, v716pk);
+                  }
+              }
+
+              /* [V724-A] Effective bit depth of THIS buffer, from the OR
+               * [V716] already computed: count the low zero bits of
+               * v716or and the residue is how many bits of the sample
+               * actually carry anything.  Real audio sits at 2..3; the
+               * post-playback break shows 12..15.
+               *
+               * Printing only on a class change keeps this off the kmsg
+               * budget, and the class change is also when V724-B takes
+               * its register snapshot -- so the good->junk boundary
+               * produces a before/after pair instead of a guess.
+               */
+
+              {
+                static int s_v724_cls = -2;
+                int        v724b;
+                int        v724cls;
+                uint32_t   v724o = v716or;
+
+                if (v724o == 0u)
+                  {
+                    v724b = -1;                     /* dead silent */
+                  }
+                else
+                  {
+                    v724b = 0;
+                    while ((v724o & 1u) == 0u)
+                      {
+                        v724o >>= 1;
+                        v724b++;
+                      }
+                  }
+
+                v724cls = (v724b < 0) ? -1 : ((v724b >= 8) ? 1 : 0);
+
+                if (v724cls != s_v724_cls)
+                  {
+                    V1024S(LOG_INFO, "[V724]] bits %d -> %d (lowzero=%d) bufs=%lu "
+                           "or=0x%08x\n",
+                           s_v724_cls, v724cls, v724b, v716bufs,
+                           (unsigned)v716or);
+                    s_v724_cls = v724cls;
+                    i2s_v724_diff(priv->config->port, "BIT");
+                  }
+
+                if ((v716bufs % 256u) == 0u)
+                  {
+                    i2s_v724_diff(priv->config->port, "PER");
+                  }
+
+                /* [V724-T1] DIAGNOSTIC: 0 disables the file-polling pair.
+                 * The hpwork panic at t=24.5 s (pc=421f9382, getumask,
+                 * vaddr=0x1a, a2=2 read out of a8=0x3fc92000 which sits
+                 * 0x50 BELOW the hpwork stack base 0x3fc92050) is 100%
+                 * reproducible, so this isolates whether the two fopen()
+                 * calls -- and the 256-byte buffer they sit on -- are what
+                 * tips the work queue over.  Restore to 1 once it is known.
+                 */
+
+                if (0 && (v716bufs % 8u) == 0u)
+                  {
+                    i2s_v724_hook(priv->config->port);
+                    i2s_v724_pins();
+                  }
+              }
+
+              /* One line per 32 buffers, ~1.9 s -- never per buffer.  or is
+               * the OR of every raw word in the window: while its low
+               * twelve bits stay zero, "only the top nibble carries
+               * information" is a measurement rather than an impression,
+               * and the moment they light up under one of the rxcfg
+               * profiles, that profile is the answer. */
+
+              if ((v716bufs & 31u) == 0u)
+                {
+                  V1024S(LOG_INFO, "[V716]] rate bufs=%lu rawbytes=%lu or=0x%08x "
+                         "pk=%u mn=%u\n",
+                         v716bufs, v716bytes, (unsigned)v716or,
+                         (unsigned)v716pk, (unsigned)v716mn);
+                }
+
+              /* [V902] raw RX phase probe.  Prints statistics of the frame the DMA
+               * actually delivered: taken from v707s, which is bfcontainer->buf, so
+               * it is before v707 compacts it and before v733 shifts anything.
+               * AND is far more diagnostic than OR: AND shows the bits EVERY sample
+               * has in common, which pins the alignment down unambiguously. */
+              {
+                static unsigned s_v902_n;
+
+                if ((s_v902_n < 64u || (v716bufs & 255u) == 0u) && v707n > 0u)
+                  {
+                    unsigned long v902or  = 0u;
+                    unsigned long v902and = 0xffffUL;
+                    uint32_t      v902j;
+                    uint32_t      v902nb  = v707n * 2u;
+
+                    for (v902j = 0u; v902j < v707n; v902j++)
+                      {
+                        unsigned long v902v =
+                          (unsigned long)((uint16_t)((uint16_t)v707s[v902j * 2u] |
+                                          ((uint16_t)v707s[v902j * 2u + 1u] << 8)));
+
+                        v902or  |= v902v;
+                        v902and &= v902v;
+                      }
+
+                    V1024S(LOG_INFO, "[V902]] n=%u addr=%p cnt=%u or=0x%08lx and=0x%08lx "
+                           "b0=%02x%02x%02x%02x b1=%02x%02x%02x%02x\n",
+                           s_v902_n, v707s, (unsigned)v707n,
+                           v902or & 0xffffUL, v902and & 0xffffUL,
+                           v707s[0], v707s[1], v707s[2], v707s[3],
+                           v707s[(v902nb > 4u) ? 4u : 0u], v707s[(v902nb > 5u) ? 5u : 0u],
+                           v707s[(v902nb > 6u) ? 6u : 0u], v707s[(v902nb > 7u) ? 7u : 0u]);
+
+                    /* [V905] P -- is this stream really one audio slot and
+                     * one zero slot?  Counted for THIS BLOCK ONLY: a parity
+                     * that alternates from buffer to buffer sums to the same
+                     * total on both sides, which is how a running tally
+                     * (v707e0/v707e1) came to read "both parities carry the
+                     * same energy" on v717/v718.
+                     *
+                     *   nz0 / nz1  non-zero words at even / odd word index
+                     *   e0  / e1   sum of |sample| on each parity
+                     *
+                     * One live slot + one zero slot => nz0 and nz1 differ by
+                     * an order of magnitude.  Comparable => the two-slot
+                     * reading of the stream is wrong and the block length is
+                     * not what makes the low byte vanish. */
+                    {
+                      uint32_t      v905nz0 = 0u;
+                      uint32_t      v905nz1 = 0u;
+                      unsigned long v905e0  = 0ul;
+                      unsigned long v905e1  = 0ul;
+                      uint32_t      v905i;
+
+                      for (v905i = 0u; v905i < v707n; v905i++)
+                        {
+                          uint16_t v905u =
+                            (uint16_t)((uint16_t)v707s[v905i * 2u] |
+                                       ((uint16_t)v707s[v905i * 2u + 1u] << 8));
+                          uint16_t v905a = (v905u & 0x8000u) ?
+                                           (uint16_t)(~v905u + 1u) : v905u;
+
+                          if (v905i & 1u)
+                            {
+                              if (v905u != 0u) { v905nz1++; }
+                              v905e1 += (unsigned long)v905a;
+                            }
+                          else
+                            {
+                              if (v905u != 0u) { v905nz0++; }
+                              v905e0 += (unsigned long)v905a;
+                            }
+                        }
+
+                      V1024S(LOG_INFO, "[V902]] P n=%u bn=%zu nz0=%u nz1=%u "
+                             "e0=%lu e1=%lu\n",
+                             s_v902_n, (size_t)v716bufs,
+                             (unsigned)v905nz0, (unsigned)v905nz1,
+                             v905e0, v905e1);
+                    }
+
+                    /* [V903] REG -- the framing registers as they stand for
+                     * THIS frame.  Bit 29 of conf1 is I2S_RX_MSB_SHIFT. */
+                    {
+                      int v903p = (int)priv->config->port;
+
+                      V1024S(LOG_INFO, "[V903]] REG n=%u rxconf=0x%08x conf1=0x%08x "
+                             "tdm=0x%08x txconf=0x%08x\n",
+                             s_v902_n,
+                             (unsigned)getreg32(I2S_RX_CONF_REG(v903p)),
+                             (unsigned)getreg32(I2S_RX_CONF1_REG(v903p)),
+                             (unsigned)getreg32(I2S_RX_TDM_CTRL_REG(v903p)),
+                             (unsigned)getreg32(I2S_TX_CONF_REG(v903p)));
+                    }
+
+                    s_v902_n++;
+                  }
+              }
+
+              /* [V733] *** Self-healing bit alignment. ***
+               *
+               * The whole-buffer OR that [V716] already computes is the
+               * measurement: real audio lights the low bits of the OR
+               * (healthy boot: or=0x0000ffff), while a stream the receiver
+               * latched k bits early leaves k low zeros (or=0x0000fffc ->
+               * k=2, "0000 7200 0200 5200" -> k=9).  Every sample is then
+               * 2^k times its true value, which is what turns a quiet room
+               * into adev 16465 / peak 32768 and keeps the VAD open.
+               *
+               * Shift it back.  Only ever to the right, so the worst case
+               * is a loud stream reduced to what it really was.
+               *
+               * The amplitude gate matters: a genuinely quiet buffer has
+               * empty low bits too, and dividing it by 4 would be wrong.
+               * Such a buffer needs no correction anyway. */
+
+              /* [V901] 20000 -> 64.  The 20000 gate could never fire on
+               * the stream it exists to repair: an 8-bit latch error
+               * divides the amplitude by 256, so a room whose true peak
+               * is 32768 arrives as 128 and sits far under the gate.
+               * 64 is still above a dead buffer (pk-mn == 0) and the
+               * v733lz 2..10 range check keeps a genuinely quiet stream
+               * from being shifted: its noise floor lights the low bits,
+               * so v733lz lands at 0 or 1 and no shift is applied. */
+              if (((unsigned)v716pk - (unsigned)v716mn) > 64u)
+                {
+                  uint32_t v733o = v716or;
+                  int      v733lz;
+
+                  if (v733o == 0u)
+                    {
+                      v733lz = -1;
+                    }
+                  else
+                    {
+                      v733lz = 0;
+
+                      while ((v733o & 1u) == 0u)
+                        {
+                          v733o >>= 1;
+                          v733lz++;
+                        }
+                    }
+
+                  if (v733lz >= 2 && v733lz <= 10)
+                    {
+                      if (g_v733_shift != v733lz)
+                        {
+                          V1024S(LOG_INFO, "[V733]] rxalign shift %d -> %d "
+                                 "(or=0x%08x pk=%u mn=%u)\n",
+                                 g_v733_shift, v733lz, (unsigned)v716or,
+                                 (unsigned)v716pk, (unsigned)v716mn);
+                        }
+
+                      g_v733_shift = v733lz;
+                    }
+                  else if (v733lz >= 0 && v733lz <= 1 && g_v733_shift != 0)
+                    {
+                      V1024S(LOG_INFO, "[V733]] rxalign aligned again (or=0x%08x)\n",
+                             (unsigned)v716or);
+                      g_v733_shift = 0;
+                    }
+                }
+
+
+              /* [V911] *** Per-boot logical-right-shift compensation. ***
+               *
+               * One logical left shift by k puts bit (15-k) -- the true
+               * sign bit -- back onto bit 15 and restores the magnitude at
+               * the same time, so no sign-extension trick is needed:
+               *   v = -100 = 0xFF9C, k = 4 -> r = 0x0FF9 -> r << 4 =
+               *   0xFF90 = -112 (sign right, four low bits lost).
+               *
+               * k = 15 - mode(highest_set_bit(buffer OR)).  Real bipolar
+               * audio sets bit 15 of the true sample, which lands on
+               * bit (15-k) of the delivered word.  Checked against the
+               * measured medians: or = 0x0FFF -> 11 -> k = 4,
+               * 0x3FFF -> 13 -> k = 2, 0x003F -> 5 -> k = 10,
+               * 0xFFFE -> 15 -> k = 0.
+               *
+               * A buffer whose OR is 0 carries no information and is not
+               * counted, so an empty window never reads as k = 15.  The
+               * mode is what makes the estimate robust: the nine startup
+               * buffers that carry the 0xfe00 transient are a minority of
+               * V911_LOCK_BLOCKS and cannot move it.
+               *
+               * Runs BEFORE [V733].  [V733] decides from v716or, the OR of
+               * the RAW words, so it is unaffected by this compensation
+               * either way -- verified in the source. */
+
+              if (!g_v911_locked)
+                {
+                  uint32_t v911o = (uint32_t)v716or & 0xffffu;
+
+                  g_v911_blocks++;
+
+                  /* [V913] the first V913_SKIP_BLOCKS buffers only
+                   * advance the counter -- they carry the startup
+                   * transient and are not allowed to vote. */
+                  if (v911o != 0u && g_v911_blocks > V913_SKIP_BLOCKS)
+                    {
+                      int v911h = 15;
+
+                      while (((v911o >> v911h) & 1u) == 0u)
+                        {
+                          v911h--;
+                        }
+
+                      g_v911_hsb[v911h]++;
+                    }
+
+                  /* Running mode, so the buffers before the lock are
+                   * compensated too; it self-corrects as real audio
+                   * outnumbers the startup transient. */
+
+                  {
+                    unsigned v911bc = 0u;
+                    int      v911bh = -1;
+                    int      v911h;
+
+                    for (v911h = 15; v911h >= 0; v911h--)
+                      {
+                        if (g_v911_hsb[v911h] > v911bc)
+                          {
+                            v911bc = g_v911_hsb[v911h];
+                            v911bh = v911h;
+                          }
+                      }
+
+                    if (v911bh >= 0)
+                      {
+                        g_v911_k = (unsigned)(15 - v911bh);
+                      }
+                  }
+
+                  if (g_v911_blocks >= V911_LOCK_BLOCKS)
+                    {
+                      unsigned v913cnt = 0u;
+                      int      v913h;
+
+                      g_v911_locked = 1;
+
+                      for (v913h = 0; v913h < 16; v913h++)
+                        {
+                          v913cnt += g_v911_hsb[v913h];
+                        }
+
+                      V1024S(LOG_INFO, "[V911]] LOCK k=%u blocks=%u skip=%u cnt=%u "
+                             "hsb=%u %u %u %u "
+                             "%u %u %u %u %u %u %u %u %u %u %u %u\n",
+                             g_v911_k, g_v911_blocks,
+                             (unsigned)V913_SKIP_BLOCKS, v913cnt,
+                             g_v911_hsb[0], g_v911_hsb[1],
+                             g_v911_hsb[2], g_v911_hsb[3],
+                             g_v911_hsb[4], g_v911_hsb[5],
+                             g_v911_hsb[6], g_v911_hsb[7],
+                             g_v911_hsb[8], g_v911_hsb[9],
+                             g_v911_hsb[10], g_v911_hsb[11],
+                             g_v911_hsb[12], g_v911_hsb[13],
+                             g_v911_hsb[14], g_v911_hsb[15]);
+
+                      /* [V914] Round tally, observation only.  How
+                       * many receiver stop/starts happened during the
+                       * startup window that this k was voted over.
+                       * V913 forced exactly one (the unconditional
+                       * [V899] heal); with the byte-OR fixed the
+                       * expectation is zero, which is what
+                       * "k stops being random" has to cash out as. */
+
+                      V1024S(LOG_INFO, "[V914]] ROUND relocks=%u heals=%u k=%u\n",
+                             (unsigned)g_v858_relocks,
+                             (unsigned)g_v858_heals,
+                             g_v911_k);
+                    }
+                }
+
+              if (g_v911_k > 0u)
+                {
+                  int16_t *v911p = (int16_t *)bfcontainer->apb->samp;
+                  uint32_t v911c = ncopy / 2u;
+                  uint32_t v911q;
+
+                  for (v911q = 0u; v911q < v911c; v911q++)
+                    {
+                      v911p[v911q] =
+                        (int16_t)(uint16_t)(((uint16_t)v911p[v911q])
+                                            << g_v911_k);
+                    }
+                }
+
+              /* [V911] What the application will actually receive, taken
+               * after the compensation above and before [V733] shifts
+               * anything: peak and the negative-sample ratio, which for a
+               * genuine bipolar stream sits near 50 %. */
+
+              if (g_v911_locked && ((v716bufs & 15u) == 0u))
+                {
+                  int16_t *v911p = (int16_t *)bfcontainer->apb->samp;
+                  uint32_t v911c = ncopy / 2u;
+                  uint32_t v911q;
+                  uint32_t v911neg = 0u;
+                  int      v911pk  = -32768;
+                  int      v911mn  =  32767;
+
+                  for (v911q = 0u; v911q < v911c; v911q++)
+                    {
+                      int v911v = (int)v911p[v911q];
+
+                      if (v911v < 0)      { v911neg++; }
+                      if (v911v > v911pk) { v911pk = v911v; }
+                      if (v911v < v911mn) { v911mn = v911v; }
+                    }
+
+                  if (v911c > 0u)
+                    {
+                      V1024S(LOG_INFO, "[V911]] k=%u bufs=%lu pk=%d mn=%d "
+                             "neg=%u.%u%% n=%u\n",
+                             g_v911_k, v716bufs,
+                             v911pk, v911mn,
+                             (unsigned)((v911neg * 100u) / v911c),
+                             (unsigned)(((v911neg * 1000u) / v911c) % 10u),
+                             (unsigned)v911c);
+                    }
+                }
+              if (g_v733_shift > 0)
+                {
+                  int16_t *v733p = (int16_t *)bfcontainer->apb->samp;
+                  uint32_t v733c = ncopy / 2u;
+                  uint32_t v733q;
+
+                  for (v733q = 0u; v733q < v733c; v733q++)
+                    {
+                      v733p[v733q] =
+                        (int16_t)(((int32_t)v733p[v733q]) >> g_v733_shift);
+                    }
+                }
+
+              /* [V877] Disabled.
+               *
+               * This block sits in i2s_rx_worker(), i.e. the audio RX hot
+               * path, and emits four syslog() lines per DMA buffer.  The
+               * board panics with EXCCAUSE=001c (LOAD_PROHIBITED) inside
+               * vsyslog right after one of these lines -- the faulting
+               * address (0x0f20366b = a8 + 0x34) is byte-for-byte the same
+               * every time and a8 holds 0x0f203637, whose bytes are
+               * '7','6',' ' -- i.e. characters out of these very hex
+               * buffers.  The dump has served its purpose; turn it back on
+               * by restoring the original condition. */
+              if (0)
+                {
+                  static const char v709h[] = "0123456789abcdef";
+                  char     v709r[16 * 5 + 1];
+                  char     v709d[16 * 5 + 1];
+                  unsigned v709k;
+                  uint16_t v709u;
+
+                  v709dump++;
+
+                  for (v709k = 0u; v709k < 16u && v709k < v707n; v709k++)
+                    {
+                      v709u = (uint16_t)((uint16_t)v707s[v709k * 2u] |
+                               ((uint16_t)v707s[v709k * 2u + 1u] << 8));
+
+                      v709r[v709k * 5u + 0u] = v709h[(v709u >> 12) & 0xfu];
+                      v709r[v709k * 5u + 1u] = v709h[(v709u >> 8) & 0xfu];
+                      v709r[v709k * 5u + 2u] = v709h[(v709u >> 4) & 0xfu];
+                      v709r[v709k * 5u + 3u] = v709h[v709u & 0xfu];
+                      v709r[v709k * 5u + 4u] = ' ';
+                    }
+
+                  v709r[v709k * 5u] = '\0';
+
+                  for (v709k = 0u;
+                       v709k < 16u && (v709k * 2u + 1u) < v707w;
+                       v709k++)
+                    {
+                      v709u = (uint16_t)(
+                                (uint16_t)bfcontainer->apb->samp[v709k * 2u] |
+                                ((uint16_t)bfcontainer->apb->samp
+                                   [v709k * 2u + 1u] << 8));
+
+                      v709d[v709k * 5u + 0u] = v709h[(v709u >> 12) & 0xfu];
+                      v709d[v709k * 5u + 1u] = v709h[(v709u >> 8) & 0xfu];
+                      v709d[v709k * 5u + 2u] = v709h[(v709u >> 4) & 0xfu];
+                      v709d[v709k * 5u + 3u] = v709h[v709u & 0xfu];
+                      v709d[v709k * 5u + 4u] = ' ';
+                    }
+
+                  v709d[v709k * 5u] = '\0';
+
+                  V1024S(LOG_INFO, "[V709]] #%u words=%u e0=%u e1=%u keep=%u deint=%d\n",
+                         v709dump, (unsigned)v707n, (unsigned)v707e0,
+                         (unsigned)v707e1,
+                         (unsigned)((v707e1 >= v707e0) ? 1u : 0u), v707deint);
+                  V1024S(LOG_INFO, "[V709]] raw : %s\n", v709r);
+                  V1024S(LOG_INFO, "[V709]] post: %u bytes: %s\n",
+                         (unsigned)v707w, v709d);
+                  V1024S(LOG_INFO, "[V709]] tdm=0x%08x conf1=0x%08x rxconf=0x%08x\n",
+                         (unsigned)getreg32(I2S_RX_TDM_CTRL_REG(
+                                     priv->config->port)),
+                         (unsigned)getreg32(I2S_RX_CONF1_REG(
+                                     priv->config->port)),
+                         (unsigned)getreg32(I2S_RX_CONF_REG(
+                                     priv->config->port)));
+                }
+            }
+          }
+
           bfcontainer->apb->nbytes = ncopy;
           i2s_dmabuf_release(bfcontainer->buf);
           bfcontainer->buf = NULL;
@@ -2624,9 +5207,40 @@ static void i2s_rx_worker(void *arg)
 
       DEBUGASSERT(bfcontainer && bfcontainer->callback);
 
-      if (priv->streaming == false)
+      /* [V698] *** ROOT CAUSE OF "the second PTT hangs on listening" ***
+       *
+       * This used to be:
+       *
+       *   if (priv->streaming == false)
+       *     {
+       *       bfcontainer->apb->flags |= AUDIO_APB_FINAL;
+       *     }
+       *
+       * priv->streaming is written only by i2s_ioctl(AUDIOIOC_START /
+       * AUDIOIOC_STOP) below, and the only caller of I2S_IOCTL() in this tree
+       * is audio_i2s.c -- the generic audio<->I2S lower half.  Our lower half
+       * is es8311, which drives this port through I2S_RECEIVE()/I2S_SEND()
+       * and never issues AUDIOIOC_START.  priv->streaming was therefore
+       * permanently false and EVERY captured buffer was flagged
+       * AUDIO_APB_FINAL.
+       *
+       * es8311_returnbuffers() reads that flag as "end of stream", latches
+       * priv->terminating and lets the es8311 worker exit as soon as inflight
+       * reaches zero, so the capture stream died after the first buffer while
+       * the UI still said "listening".  The messy teardown freed apbs the
+       * driver still owned; the double apb_free() pushed one heap block onto
+       * the free list twice, and the next mm_malloc() walked into it
+       * (EXCCAUSE=001d, vaddr=0x8, task xiaozhi_ui).
+       *
+       * The lower half has no business ending the stream.  The upper half
+       * learns that from AUDIOIOC_STOP: es8311_stop() sends AUDIO_MSG_STOP,
+       * which latches priv->terminating for real.
+       */
+
+      if ((bfcontainer->apb->flags & AUDIO_APB_FINAL) != 0)
         {
-          bfcontainer->apb->flags |= AUDIO_APB_FINAL;
+          V1024S(LOG_ERR, "[V698]] *** stray FINAL on live RX apb=%p\n",
+                 bfcontainer->apb);
         }
 
       bfcontainer->callback(&priv->dev, bfcontainer->apb,
@@ -2678,6 +5292,7 @@ static int g_i2s_rxonly_port = -1;
  */
 
 volatile int g_v380_loopback = 0;
+
 volatile int g_v380_txmaster = 1;
 static int   g_v380_lb_applied = -1;
 
@@ -2716,6 +5331,20 @@ static void i2s_configure(struct esp32s3_i2s_s *priv)
   uint32_t tx_conf1 = 0;
   uint32_t rx_conf  = 0;
   uint32_t rx_conf1 = 0;
+
+  /* [V903] CFG1 -- full-port reprogram. */
+  {
+    static unsigned s_v903_c1;
+    int v903p = (int)priv->config->port;
+
+    V1024S(LOG_INFO, "[V903]] CFG1 configure #%u sr=%u bits=%u "
+           "rxconf=0x%08x conf1=0x%08x tdm=0x%08x txconf=0x%08x\n",
+           ++s_v903_c1, (unsigned)priv->rate, (unsigned)priv->data_width, 
+           (unsigned)getreg32(I2S_RX_CONF_REG(v903p)),
+           (unsigned)getreg32(I2S_RX_CONF1_REG(v903p)),
+           (unsigned)getreg32(I2S_RX_TDM_CTRL_REG(v903p)),
+           (unsigned)getreg32(I2S_TX_CONF_REG(v903p)));
+  }
 
   /* Set peripheral clock and clear reset */
 
@@ -2903,8 +5532,7 @@ static void i2s_configure(struct esp32s3_i2s_s *priv)
       esp32s3_gpio_matrix_in(priv->config->bclk_pin,
                              priv->config->bclk_in_insig, 0);
 
-      /* [V394] IRQ-stack: silenced */ if (0) syslog(LOG_INFO,
-             "[V386] rx clock input routed: ws(gpio%d)<-sig%u "
+      /* [V394] IRQ-stack: silenced */ if (0) V1024S(LOG_INFO, "[V386]] rx clock input routed: ws(gpio%d)<-sig%u "
              "bclk(gpio%d)<-sig%u\n",
              (int)priv->config->ws_pin,
              (unsigned)priv->config->ws_in_insig,
@@ -2956,6 +5584,8 @@ static void i2s_configure(struct esp32s3_i2s_s *priv)
 
       modifyreg32(I2S_TX_CONF_REG(priv->config->port), 0, I2S_TX_RESET);
       modifyreg32(I2S_TX_CONF_REG(priv->config->port), I2S_TX_RESET, 0);
+
+      g_v671_cfg_valid = 0;   /* [V671] TX module reset */
 
       /* Enable/disable I2S TX slave mode */
 
@@ -3109,6 +5739,49 @@ static void i2s_configure(struct esp32s3_i2s_s *priv)
            * instead of from I2S0I_BCK_IN / I2S0I_WS_IN.
            */
 
+          /* [V691] No-reflash A/B for the receiver's clock source:
+           *
+           *     nsh> echo m > /tmp/rxrole.txt   RX master (own divider)
+           *     nsh> echo s > /tmp/rxrole.txt   RX slave (TX generator)
+           *
+           * Re-read on every i2s_configure(), so the next capture picks the
+           * new value up without touching the firmware. */
+
+          {
+            FILE *v691f = fopen("/tmp/rxrole.txt", "r");
+
+            if (v691f != NULL)
+              {
+                int v691c = fgetc(v691f);
+
+                fclose(v691f);
+
+                if (v691c == 'm' || v691c == 'M')
+                  {
+                    /* [V913] *** Locked to slave. ***
+                     *
+                     * This is the only run-time write of
+                     * g_v390_rxmaster besides its definition, and
+                     * 'm' is the arm V913 removes -- a second
+                     * free-running divider on a pad that already
+                     * carries the transmitter's clock.  'm' now
+                     * selects slave as well, so a leftover
+                     * /tmp/rxrole.txt cannot resurrect the master
+                     * arm without a reflash.  's' is unchanged.
+                     *
+                     * The read is kept (not deleted) so the hook
+                     * stays in place and the file is still the
+                     * documented way back if this ever has to be
+                     * re-armed from source. */
+                    g_v390_rxmaster = 0;
+                  }
+                else if (v691c == 's' || v691c == 'S')
+                  {
+                    g_v390_rxmaster = 0;
+                  }
+              }
+          }
+
           if (i2s_tx_active(priv) && !g_v390_rxmaster)
             {
               modifyreg32(I2S_RX_CONF_REG(priv->config->port), 0,
@@ -3120,8 +5793,7 @@ static void i2s_configure(struct esp32s3_i2s_s *priv)
                           I2S_RX_SLAVE_MOD, 0);
             }
 
-          /* [V394] IRQ-stack: silenced */ if (0) syslog(LOG_INFO,
-                 "[V391] rx role=%s rxconf=0x%08x\n",
+          /* [V394] IRQ-stack: silenced */ if (0) V1024S(LOG_INFO, "[V391]] rx role=%s rxconf=0x%08x\n",
                  g_v390_rxmaster ? "MASTER" : "SLAVE",
                  (unsigned)getreg32(
                    I2S_RX_CONF_REG(priv->config->port)));
@@ -3166,14 +5838,18 @@ static void i2s_configure(struct esp32s3_i2s_s *priv)
            * but write them so the intent survives a reset default
            * change).
            */
-          modifyreg32(I2S_RX_TDM_CTRL_REG(priv->config->port),
-                      I2S_RX_TDM_TOT_CHAN_NUM_M,
-                      FIELD_TO_VALUE(I2S_RX_TDM_TOT_CHAN_NUM, 1));
-          modifyreg32(I2S_RX_TDM_CTRL_REG(priv->config->port),
-                      I2S_RX_TDM_PDM_CHAN0_EN_M |
-                      I2S_RX_TDM_PDM_CHAN1_EN_M,
-                      I2S_RX_TDM_PDM_CHAN0_EN |
-                      I2S_RX_TDM_PDM_CHAN1_EN);
+          /* [V682] Same defect as i2s_rxdma_start(): the chan_en half
+           * has to be assigned, because bits 2..15 reset to 1.  The old
+           * modifyreg32() pair here left the register at 0x0001ffff. */
+          {
+            uint32_t v682c =
+              getreg32(I2S_RX_TDM_CTRL_REG(priv->config->port));
+
+            v682c &= 0xffff0000u;
+            v682c |= FIELD_TO_VALUE(I2S_RX_TDM_TOT_CHAN_NUM, 1);
+            v682c |= g_i2s_rx_slot_mask;
+            putreg32(v682c, I2S_RX_TDM_CTRL_REG(priv->config->port));
+          }
 
           /* [V229] See the TX comment: ESP-IDF's i2s_ll_rx_enable_tdm() also
            * clears rx_pdm2pcm_en, and this driver never wrote the register. */
@@ -3244,6 +5920,210 @@ static void i2s_configure(struct esp32s3_i2s_s *priv)
     {
       (void)i2s_clock_source_bringup(priv);
     }
+
+  /* [V716] *** RX register sweep, no reflash between runs. ***
+   *
+   * Straight off the DMA the captured words look like this (v714):
+   *
+   *   [V709] raw : ffff 0000 f000 2000 e000 3000 a000 4000 c000 4000 ...
+   *   [V709] tdm=0x00010001 conf1=0x2f3de381 rxconf=0x00089604
+   *
+   * conf1 decodes, at the real SOC field positions, to RX_BITS_MOD =
+   * RX_TDM_CHAN_BITS = RX_HALF_SAMPLE_BITS = 15 and RX_TDM_WS_WIDTH = 1
+   * -- a two-bit-clock frame sync, since the header defines the ws_out
+   * width as (RX_TDM_WS_WIDTH + 1) * T_bck.  The delivered rate is wrong
+   * too: 2046 valid bytes per 4092-byte descriptor, ~36 kB/s where 16 kHz
+   * stereo 16-bit wants 64 kB/s, so roughly 9.1 kframe/s instead of 16.
+   *
+   * i2s_set_datawidth() mirrors its TX and RX conditions.  For this port
+   * (audio_std_mode is I2S_TDM_PHILIPS, not I2S_TDM_PCM) TX is given
+   * TX_TDM_WS_WIDTH = data_width - 1 = 15 and plays cleanly, while RX is
+   * given RX_TDM_WS_WIDTH = 1 -- and both get HALF_SAMPLE_BITS =
+   * data_width - 1, where ESP-IDF's HAL uses half the slot width.
+   *
+   * That is a strong suspicion, not a proof, so the fields are made
+   * sweepable instead of guessed at.  /tmp/rxcfg.txt holds a list of
+   * single-character actions, applied in order, so combinations are just
+   * concatenation:
+   *
+   *   nsh> echo 1  > /tmp/rxcfg.txt   RX_HALF_SAMPLE_BITS = dw/2 - 1
+   *   nsh> echo 4  > /tmp/rxcfg.txt   RX_TDM_WS_WIDTH     = dw - 1
+   *   nsh> echo 14 > /tmp/rxcfg.txt   both
+   *   nsh> echo 1234 > /tmp/rxcfg.txt all of bits/chan/half/ws
+   *   nsh> rm      /tmp/rxcfg.txt     driver defaults
+   *
+   * (1 = HALF_SAMPLE_BITS, 2 = TDM_CHAN_BITS, 3 = BITS_MOD, 4 =
+   * TDM_WS_WIDTH, 5 = MSB_SHIFT -> 0, 6 = LEFT_ALIGN -> 0.)
+   *
+   * Read here, at the end of i2s_configure().  The capture path reaches
+   * this function through audio_capture_open(), so the always-on listener
+   * re-reads it once per session (~14 s).  Change the file, wait one
+   * session, read the log.
+   */
+
+  if (i2s_rx_active(priv))
+    {
+      int   v716port = priv->config->port;
+      FILE *v716f;
+
+      /* RX_LEFT_ALIGN is the one field i2s_configure() never writes, so an
+       * override would survive into every later session.  Restart from its
+       * reset default on each pass and let the file decide.  Everything
+       * else is re-programmed by i2s_set_datawidth() and the TDM_CTRL
+       * block earlier in this same call, so no other field needs undoing. */
+
+      /* [V721] Was I2S_RX_LEFT_ALIGN (= 1).  This diagnostic block runs at
+       * the end of i2s_configure(), i.e. after i2s_set_datawidth(), so it
+       * used to overwrite the V721B-1 fix on every configure and put the
+       * line back to the dead setting.  v721 slot 7 measured it: 1 -> all
+       * words in {0,1,3}, 0 -> real audio.  Write 0 so both writers
+       * agree. */
+
+      modifyreg32(I2S_RX_CONF_REG(v716port), I2S_RX_LEFT_ALIGN_M,
+                  0);
+
+      {
+        /* [V717] Self-driving profile table.  One entry per configure call,
+         * in this order:
+         *
+         * [V718] Retargeted.  V718-1 repaired the default, so entry 0 is
+         * now the fixed baseline and "4" would be a no-op.  Every remaining
+         * entry turns ONE alignment knob, hunting the residual 3-bit left
+         * shift: under WS=15 all 51 raw dumps have low3_or = 0x0, i.e. every
+         * sample is a multiple of 8 and only 13 of the 16 bits carry signal.
+         *
+         *   0 ""      repaired default (WS_WIDTH = dw - 1)
+         *   1 "6"     RX_LEFT_ALIGN       = 0   (i2s_configure forces 1)
+         *   2 "5"     RX_MSB_SHIFT        = 0   (currently 1, PHILIPS)
+         *   3 "56"    left-align 0 + msb-shift 0
+         *   4 "3"     RX_BITS_MOD         = dw/2 - 1
+         *   5 "2"     RX_TDM_CHAN_BITS    = dw/2 - 1
+         *   6 "1"     RX_HALF_SAMPLE_BITS = dw/2 - 1
+         *   7 "561"   left-align 0 + msb-shift 0 + half
+         *   8 "56"    repeat of entry 3, as a stability check
+         *
+         * One entry per configure, ~2 minutes for the sweep, no NSH and no
+         * reflash.  /tmp/rxcfg.txt still overrides the table when readable. */
+
+        /* [V722] The sweep table is what broke the microphone -- there
+         * was no missing fix left to find.
+         *
+         * v721b landed correct RX framing (WS_WIDTH = dw - 1,
+         * LEFT_ALIGN = 0) and this block's entry 0 leaves it alone, so
+         * _v721b_boot.log starts out healthy: 64 raw dumps under
+         * conf1 = 0x2f3de38f, medDx 96, maxabs 624, real audio.  Then
+         * at t = 38.36 this table reached entry 2 ("5"), wrote
+         * I2S_RX_MSB_SHIFT = 0, and the remaining 69 dumps are words
+         * drawn from {0000,4000,8000,c000} -- medDx 16384, maxabs
+         * 32768.  The split by conf1 is exact: 64/64 good versus
+         * 69/69 junk, no overlap.
+         *
+         * Those junk dumps are also what the handoff filed as
+         * "possible clipping".  They are not: the good dumps peak at
+         * 624, about -36 dBFS, so the line is far too quiet rather
+         * than overdriven, and cutting ADC gain would have made it
+         * worse.
+         *
+         * i2s_configure() does re-assert MSB_SHIFT in its PHILIPS
+         * branch, but this block runs after it, so the scanner just
+         * re-broke the line on each configure -- and it walks further
+         * into the table the longer the board is up, entries 3..8
+         * turning two or three knobs at once.  A device left running
+         * degrades permanently, one knob per listening session.
+         * Entries 0 and 1 are harmless, which is why v721b looked
+         * fine for its first 38 seconds.
+         *
+         * So: one entry, the known-good baseline.  /tmp/rxcfg.txt
+         * still overrides it, which is the whole point of the block,
+         * so nothing is lost -- it simply stops inventing
+         * configurations on its own. */
+
+        static const char *v717tab[] =
+          { "" };
+        static unsigned    v717n;
+        char   v716b[32];
+        size_t v716n;
+        size_t v716k;
+
+        v716f = fopen("/tmp/rxcfg.txt", "r");
+
+        if (v716f != NULL)
+          {
+            v716n = fread(v716b, 1, sizeof(v716b) - 1u, v716f);
+            fclose(v716f);
+          }
+        else
+          {
+            const char *v717t = v717tab[0];
+
+            v716n = strlen(v717t);
+            memcpy(v716b, v717t, v716n);
+          }
+
+        V1024S(LOG_INFO, "[V717]] profile=%u tok='%s' dw=%d rate=%d\n",
+               (unsigned)v717n, v716b, (int)priv->data_width,
+               (int)priv->rate);
+
+        v717n++;
+        g_v717_gen++;
+        v716b[v716n] = '\0';
+
+          for (v716k = 0u; v716k < v716n; v716k++)
+            {
+              uint32_t v716v;
+
+              switch (v716b[v716k])
+                {
+                  case '1':
+                    v716v = (uint32_t)(priv->data_width >> 1) - 1u;
+                    modifyreg32(I2S_RX_CONF1_REG(v716port),
+                                I2S_RX_HALF_SAMPLE_BITS_M,
+                                v716v << I2S_RX_HALF_SAMPLE_BITS_S);
+                    break;
+
+                  case '2':
+                    v716v = (uint32_t)(priv->data_width >> 1) - 1u;
+                    modifyreg32(I2S_RX_CONF1_REG(v716port),
+                                I2S_RX_TDM_CHAN_BITS_M,
+                                v716v << I2S_RX_TDM_CHAN_BITS_S);
+                    break;
+
+                  case '3':
+                    v716v = (uint32_t)(priv->data_width >> 1) - 1u;
+                    modifyreg32(I2S_RX_CONF1_REG(v716port),
+                                I2S_RX_BITS_MOD_M,
+                                v716v << I2S_RX_BITS_MOD_S);
+                    break;
+
+                  case '4':
+                    v716v = (uint32_t)priv->data_width - 1u;
+                    modifyreg32(I2S_RX_CONF1_REG(v716port),
+                                I2S_RX_TDM_WS_WIDTH_M,
+                                v716v << I2S_RX_TDM_WS_WIDTH_S);
+                    break;
+
+                  case '5':
+                    modifyreg32(I2S_RX_CONF1_REG(v716port),
+                                I2S_RX_MSB_SHIFT_M, 0);
+                    break;
+
+                  case '6':
+                    modifyreg32(I2S_RX_CONF_REG(v716port),
+                                I2S_RX_LEFT_ALIGN_M, 0);
+                    break;
+
+                  default:
+                    break;
+                }
+            }
+
+      }
+
+      V1024S(LOG_INFO, "[V717]] regs conf1=0x%08x rxconf=0x%08x tdm=0x%08x\n",
+             (unsigned)getreg32(I2S_RX_CONF1_REG(v716port)),
+             (unsigned)getreg32(I2S_RX_CONF_REG(v716port)),
+             (unsigned)getreg32(I2S_RX_TDM_CTRL_REG(v716port)));
+    }
 }
 
 /* [V93] Give the active direction sole ownership of the port.
@@ -3252,6 +6132,225 @@ static void i2s_configure(struct esp32s3_i2s_s *priv)
  * I2S_RECEIVE.  Idempotent: reconfiguration happens only when the direction
  * actually changes, so a stream of capture buffers does not restart the DMA.
  */
+
+/* [V660] One-shot capture-path health dump.
+ *
+ * Called from the application's capture thread immediately after
+ * AUDIOIOC_START returns, i.e. from ordinary task context.  The same
+ * measurement used to live in i2s_rx_channel_start() and had to be silenced
+ * by [V394] because syslog() on the interrupt stack overflowed it (all of
+ * [V382]/[V383]/[V390]/[RXCLK] are wrapped in `if (0)` for that reason).
+ *
+ * Why it matters: every PTT chunk in the v658 field run reported peak=6, and
+ * the [V380] calibration says a healthy loopback shows peak == 8 while real
+ * microphone audio shows "a much larger peak".  A constant 6 is an idle
+ * serial stream, so the first question is whether the clocks are moving:
+ *
+ *   MCLK(11)/BCLK(10) hi ~= 1000/2000 -> clock running
+ *   WS(8)             hi ~=  500/2000 -> 50% duty frame sync
+ *   DIN(9)            hi ~= 1000/2000 -> the codec is shifting data
+ *   any line stuck at 0 or 2000       -> that line is dead
+ */
+
+/* [V690] Tiny queue walker: sq_count() is not in every NuttX revision and
+ * the RX queues are short, so guard the walk explicitly. */
+
+static int i2s_v690_qlen(FAR sq_queue_t *q)
+{
+  FAR sq_entry_t *e;
+  int n = 0;
+
+  for (e = sq_peek(q); e != NULL; e = sq_next(e))
+    {
+      if (++n > 64)
+        {
+          break;
+        }
+    }
+
+  return n;
+}
+
+void esp32s3_i2s_rx_health(void)
+{
+  static int s_v660_n;
+  unsigned int mhi = 0;
+  unsigned int bhi = 0;
+  unsigned int whi = 0;
+  unsigned int dhi = 0;
+  unsigned int k;
+
+  /* [V682] Slot-mask override, read on EVERY capture start (before the
+   * one-shot guard below) so the candidates can be swept from NSH:
+   *
+   *     echo l > /tmp/rxslot.txt    slot 0 only  (mono, default)
+   *     echo r > /tmp/rxslot.txt    slot 1 only
+   *     echo b > /tmp/rxslot.txt    both slots
+   *
+   * The value is picked up by the next i2s_rxdma_start() re-arm, i.e.
+   * within a few milliseconds, without touching the codec.
+   */
+  {
+    FILE *v682f = fopen("/tmp/rxslot.txt", "r");
+
+    if (v682f != NULL)
+      {
+        int v682c = fgetc(v682f);
+
+        fclose(v682f);
+
+        if (v682c == 'r' || v682c == 'R')
+          {
+            g_i2s_rx_slot_mask = I2S_RX_TDM_PDM_CHAN1_EN;
+          }
+        else if (v682c == 'b' || v682c == 'B')
+          {
+            g_i2s_rx_slot_mask = I2S_RX_TDM_PDM_CHAN0_EN |
+                                 I2S_RX_TDM_PDM_CHAN1_EN;
+          }
+        else if (v682c == 'l' || v682c == 'L')
+          {
+            g_i2s_rx_slot_mask = I2S_RX_TDM_PDM_CHAN0_EN;
+          }
+      }
+  }
+
+  /* [V690] RX pipeline counters.
+   *
+   * Every capture session so far delivered exactly six 4092-byte buffers and
+   * then went quiet, and the 4 s kmsg pump makes counting log lines useless
+   * (lines replay 2-3x and multi-line records merge).  These counters settle
+   * it: if recv grows but eof does not, the transfer is being armed and
+   * never completing; if eof grows but act stays at 1, i2s_rx_schedule()
+   * never matched SUC_EOF_DES_ADDR and i2s_rxdma_start() is bailing out on
+   * the "rx.act not empty" early return.
+   *
+   * Written to a file as well, because the kmsg ring is only 32 KB. */
+  {
+    char v690b[192];
+
+    snprintf(v690b, sizeof(v690b),
+             "recv=%u start=%u eof=%u isr=%u pb=%u done=%u pend=%d act=%d "
+             "done_q=%d slot=0x%02x mono=%d bounce=%d txa=%d txp=%d txd=%d\n",
+             (unsigned)g_v94_recv, (unsigned)g_v94_start,
+             (unsigned)g_v94_eof, (unsigned)g_v94_isr,
+             (unsigned)g_v94_pb, (unsigned)g_v94_done,
+             g_v690_priv ? i2s_v690_qlen(&g_v690_priv->rx.pend) : -1,
+             g_v690_priv ? i2s_v690_qlen(&g_v690_priv->rx.act)  : -1,
+             g_v690_priv ? i2s_v690_qlen(&g_v690_priv->rx.done) : -1,
+             (unsigned)g_i2s_rx_slot_mask, (int)g_i2s_rx_mono,
+             (int)(g_i2s_dmabuf_used[0] + g_i2s_dmabuf_used[1] +
+                   g_i2s_dmabuf_used[2] + g_i2s_dmabuf_used[3]),
+             g_v690_priv ? i2s_v690_qlen(&g_v690_priv->tx.act)  : -1,
+             g_v690_priv ? i2s_v690_qlen(&g_v690_priv->tx.pend) : -1,
+             g_v690_priv ? i2s_v690_qlen(&g_v690_priv->tx.done) : -1);
+
+    V1024S(LOG_INFO, "[V690]] rx %s", v690b);
+
+    {
+      FILE *v690f = fopen("/tmp/rxstat.txt", "w");
+
+      if (v690f != NULL)
+        {
+          fputs(v690b, v690f);
+          fclose(v690f);
+        }
+
+      v690f = fopen("/tmp/rxlog.txt", "a");
+      if (v690f != NULL)
+        {
+          fputs(v690b, v690f);
+          fclose(v690f);
+        }
+    }
+  }
+
+  /* [V694] *** Arm both engines here -- this is the only call site that is
+   * guaranteed to run AFTER every i2s_configure(). ***
+   *
+   * native_capture_start() calls this function immediately after
+   * AUDIOIOC_START returns, whereas i2s_configure() pulses I2S_TX_RESET and
+   * clears I2S_RX_START / I2S_TX_START *after* i2s_rx_channel_start().  The
+   * v691 keep-alive lives in i2s_rxdma_start(), in the RX worker and in
+   * set_rxonly(), none of which can run when the transfer never starts, so
+   * whether the clocks came up at all depended on the interleaving.  With
+   * the START bits clear the ES8311 has no bit clock, never drives DIN, and
+   * the session dies with five "capture EIO" retries and zero bytes:
+   *
+   *   good: rxconf=0x0008960c txconf=0x00089204  (BIT(2) set in both)
+   *   bad : rxconf=0x00089600 txconf=0x00089260  (BIT(2) clear in both)
+   *
+   * This block is deliberately ABOVE the s_v660_n one-shot guard below, so
+   * it runs on every call, and it is idempotent.
+   */
+  if (g_v690_priv != NULL)
+    {
+      static unsigned long s_v694_arms;
+      int      v694port = (int)g_v690_priv->config->port;
+      uint32_t v694tx   = getreg32(I2S_TX_CONF_REG(v694port));
+      uint32_t v694rx   = getreg32(I2S_RX_CONF_REG(v694port));
+
+      if ((v694tx & I2S_TX_STOP_EN) != 0)
+        {
+          modifyreg32(I2S_TX_CONF_REG(v694port), I2S_TX_STOP_EN, 0);
+          modifyreg32(I2S_TX_CONF_REG(v694port), 0, I2S_TX_UPDATE);
+        }
+
+      if ((v694tx & I2S_TX_START) == 0)
+        {
+          modifyreg32(I2S_TX_CONF_REG(v694port), 0, I2S_TX_START);
+          modifyreg32(I2S_TX_CONF_REG(v694port), 0, I2S_TX_UPDATE);
+        }
+
+      if ((v694rx & I2S_RX_START) == 0)
+        {
+          modifyreg32(I2S_RX_CONF_REG(v694port), 0, I2S_RX_START);
+          modifyreg32(I2S_RX_CONF_REG(v694port), 0, I2S_RX_UPDATE);
+        }
+
+      if (s_v694_arms < 8u)
+        {
+          s_v694_arms++;
+          V1024S(LOG_INFO, "[V694]] arm port=%d tx 0x%08x->0x%08x rx 0x%08x->0x%08x\n",
+                 v694port, (unsigned)v694tx,
+                 (unsigned)getreg32(I2S_TX_CONF_REG(v694port)),
+                 (unsigned)v694rx,
+                 (unsigned)getreg32(I2S_RX_CONF_REG(v694port)));
+        }
+    }
+
+  if (s_v660_n >= 12)
+    {
+      return;
+    }
+
+  s_v660_n++;
+
+  modifyreg32(IO_MUX_GPIO8_REG,  0, (1u << 9));   /* WS   */
+  modifyreg32(IO_MUX_GPIO9_REG,  0, (1u << 9));   /* DIN  */
+  modifyreg32(IO_MUX_GPIO10_REG, 0, (1u << 9));   /* BCLK */
+  modifyreg32(IO_MUX_GPIO11_REG, 0, (1u << 9));   /* MCLK */
+
+  for (k = 0; k < 2000; k++)
+    {
+      if (esp32s3_gpioread(11)) { mhi++; }
+      if (esp32s3_gpioread(10)) { bhi++; }
+      if (esp32s3_gpioread(8))  { whi++; }
+      if (esp32s3_gpioread(9))  { dhi++; }
+    }
+
+  V1024S(LOG_INFO, "[V660]] pins MCLK(11)=%u BCLK(10)=%u WS(8)=%u DIN(9)=%u /2000 | "
+         "rxconf=0x%08x txconf=0x%08x rxstart=%d txstart=%d rxonly=%d "
+         "loopback=%d txmaster=%d rxslot=0x%02x rxtdm=0x%08x\n",
+         mhi, bhi, whi, dhi,
+         (unsigned)getreg32(I2S_RX_CONF_REG(0)),
+         (unsigned)getreg32(I2S_TX_CONF_REG(0)),
+         (getreg32(I2S_RX_CONF_REG(0)) & I2S_RX_START) ? 1 : 0,
+         (getreg32(I2S_TX_CONF_REG(0)) & I2S_TX_START) ? 1 : 0,
+         g_i2s_rxonly_port, g_v380_loopback, g_v380_txmaster,
+         (unsigned)g_i2s_rx_slot_mask,
+         (unsigned)getreg32(I2S_RX_TDM_CTRL_REG(0)));
+}
 
 void esp32s3_i2s_set_rxonly(FAR struct i2s_dev_s *dev, bool on)
 {
@@ -3270,6 +6369,9 @@ void esp32s3_i2s_set_rxonly(FAR struct i2s_dev_s *dev, bool on)
       return;
     }
 
+  /* [V644] PROBE: mid-stream port reconfiguration (the [V89] hazard). */
+  
+
   /* Stop both engines before rewiring the clock. */
 
       /* [V341] The clock source and its dividers are now handled in exactly
@@ -3286,6 +6388,368 @@ void esp32s3_i2s_set_rxonly(FAR struct i2s_dev_s *dev, bool on)
   g_v380_lb_applied = g_v380_loopback;
 
   i2s_configure(priv);
+
+  /* [V691] i2s_configure() pulses I2S_TX_RESET, which drops TX_START, and
+   * the pads carry the TX generator's BCK/WS.  Put the frame clock back
+   * before the caller arms the DMA. */
+
+  if (on)
+    {
+      i2s_v691_clock_ensure(priv, 1);
+    }
+}
+
+/* [V858] *** Re-lock the receiver so it can never be left behind a
+ * playback. ***
+ *
+ * The symptom: after the first TTS playback the capture returns all
+ * zeros (or a frozen DC such as 0x0012, peak 18) for the rest of the
+ * boot, while the ES8311 readback stays perfectly healthy
+ * (r00=0x80 r32=0xbf i2c_errs=0) and the pads are still clocked.  QA
+ * hit it in 3 of 4 cold boots.
+ *
+ * It is NOT the clocks.  Every [V660] pins probe in the dead window
+ * still reads
+ *     MCLK(11)=1513 BCLK(10)=991 WS(8)=1008 DIN(9)=148 /2000
+ * i.e. the codec is being clocked and is shifting data at us.  What is
+ * wrong is where the receiver's bit-aligned frame sits RELATIVE to that
+ * data, and the register file cannot tell us: v857 qa2 and qa4 both
+ * carry stretches of
+ *     rxconf=0x00081604 tdm=0x00010001 conf1=0x2f3de38f
+ * with one of them delivering real audio and the other a constant.
+ * The two roles behave the same way -- each has been measured both
+ * working and dead, which is the signature of a free-running phase,
+ * not of a wrong setting.
+ *
+ * So this function does the one thing that IS deterministic: it walks
+ * the port through exactly the sequence it walks through at boot, in
+ * the same order, every time, instead of inheriting whatever state the
+ * transmitter was left in by the playback that just finished.  The
+ * [V382] clock-only start inside i2s_rx_channel_start() is guarded by
+ * "if the transmitter is not already started" and therefore does
+ * nothing at all once a playback has left TX_START set with the
+ * playback frame (MONO / CHAN_EQUAL / LEFT_ALIGN / STOP_EN all changed
+ * by i2s_txdma_start()) latched in -- which is the state the board is
+ * in when the microphone dies.
+ *
+ * The relock is idempotent and cheap (~ninety register writes, no
+ * waiting on the codec), and it never touches the ES8311's I2C
+ * registers, so the verified codec configuration survives it. */
+
+static int i2s_v858_tx_busy(struct esp32s3_i2s_s *priv)
+{
+  return !(sq_empty(&priv->tx.act) && sq_empty(&priv->tx.pend) &&
+           sq_empty(&priv->tx.done));
+}
+
+static int i2s_v858_rx_busy(struct esp32s3_i2s_s *priv)
+{
+  return !(sq_empty(&priv->rx.act) && sq_empty(&priv->rx.pend));
+}
+
+static void i2s_v858_relock(int slave, int verbose)
+{
+  struct esp32s3_i2s_s *priv = (struct esp32s3_i2s_s *)g_v690_priv;
+  int      port;
+  uint32_t rx0;
+  uint32_t tx0;
+  uint32_t tdm;
+  int      spins;
+
+  if (priv == NULL || !priv->config->rx_en)
+    {
+      return;
+    }
+
+  port = (int)priv->config->port;
+
+  /* [V903] CFG2 -- V858 relock/heal/capture_begin, state BEFORE. */
+  {
+    static unsigned s_v903_c2;
+
+    V1024S(LOG_INFO, "[V903]] CFG2 relock #%u PRE sr=%u bits=%u slave=%d "
+           "rxconf=0x%08x conf1=0x%08x tdm=0x%08x txconf=0x%08x\n",
+           ++s_v903_c2, (unsigned)priv->rate, (unsigned)priv->data_width,  slave,
+           (unsigned)getreg32(I2S_RX_CONF_REG(port)),
+           (unsigned)getreg32(I2S_RX_CONF1_REG(port)),
+           (unsigned)getreg32(I2S_RX_TDM_CTRL_REG(port)),
+           (unsigned)getreg32(I2S_TX_CONF_REG(port)));
+  }
+
+  rx0 = getreg32(I2S_RX_CONF_REG(port));
+  tx0 = getreg32(I2S_TX_CONF_REG(port));
+
+  g_v858_relocks++;
+
+  /* [V914] Observation only -- nothing below is changed.  Every
+   * relock is a receiver stop/start, and a stop/start redraws the RX
+   * bit phase, so the count of entries is the number that decides
+   * whether V914 worked: the [V899] verdict used to force exactly one
+   * of these per boot, and with the byte-OR fixed it should be none.
+   * rx0 is the snapshot taken above, i.e. the state BEFORE this
+   * relock touches RX_CONF. */
+
+  {
+    static unsigned s_v914_n;
+
+    V1024S(LOG_INFO, "[V914]] relock #%u slave=%d rxconf=0x%08x\n",
+           ++s_v914_n, slave, (unsigned)rx0);
+  }
+
+  /* 1. both engines off.  Everything below has to be latched into the
+   *    clock domains while they are stopped, which is exactly what the
+   *    [V382] / [V721] / [V722] fixes established. */
+
+  modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_START, 0);
+  modifyreg32(I2S_TX_CONF_REG(port), I2S_TX_START, 0);
+
+  /* 2. reset both data paths, the way the boot path does. */
+
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_RESET);
+  modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_RESET, 0);
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_FIFO_RESET);
+  modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_FIFO_RESET, 0);
+
+  modifyreg32(I2S_TX_CONF_REG(port), 0, I2S_TX_RESET);
+  modifyreg32(I2S_TX_CONF_REG(port), I2S_TX_RESET, 0);
+  modifyreg32(I2S_TX_CONF_REG(port), 0, I2S_TX_FIFO_RESET);
+  modifyreg32(I2S_TX_CONF_REG(port), I2S_TX_FIFO_RESET, 0);
+
+  /* 3. the divider the common bring-up selected and validated.  The
+   *    [V670] 150 MHz source plus the [V341] bring-up is the only
+   *    place the clock is derived; reuse the values it latched instead
+   *    of re-deriving them (i2s_set_clock() is far too heavy to run
+   *    on a capture start). */
+
+  if (g_txclk_valid)
+    {
+      putreg32(g_txclk_clkm,  I2S_TX_CLKM_CONF_REG(port));
+      putreg32(g_txclk_div,   I2S_TX_CLKM_DIV_CONF_REG(port));
+      putreg32(g_txclk_conf1, I2S_TX_CONF1_REG(port));
+    }
+
+  /* 4. the pads have to be readable by the receiver's clock inputs.
+   *
+   * i2s_configure()'s master branch leaves BCK and WS configured as
+   * outputs only, and esp32s3_gpio_matrix_in() cannot deliver a level
+   * the pad's input buffer never sees.  The [V383] / [V660] / [V724]
+   * probes all enable IO_MUX FUN_IE (bit 9) before they read the pad,
+   * which is what makes them read anything at all; the capture path
+   * used to depend on one of those probes having run.  Do it here so
+   * the slave clock path has a real input whether or not any probe
+   * has fired yet. */
+
+  modifyreg32(IO_MUX_GPIO8_REG,  0, (1u << 9));   /* WS   */
+  modifyreg32(IO_MUX_GPIO9_REG,  0, (1u << 9));   /* DIN  */
+  modifyreg32(IO_MUX_GPIO10_REG, 0, (1u << 9));   /* BCLK */
+
+  esp32s3_gpio_matrix_in(priv->config->ws_pin,
+                         priv->config->ws_in_insig, 0);
+  esp32s3_gpio_matrix_in(priv->config->bclk_pin,
+                         priv->config->bclk_in_insig, 0);
+
+  /* 5. receiver framing: 16-bit Philips, two slots, slot 0 only.  The
+   *    three fields the [V718] / [V721] / [V722] sweeps isolated,
+   *    written together so no later i2s_configure() can split them. */
+
+  modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_LEFT_ALIGN_M, 0);
+
+  modifyreg32(I2S_RX_CONF1_REG(port), I2S_RX_TDM_WS_WIDTH_M,
+              FIELD_TO_VALUE(I2S_RX_TDM_WS_WIDTH, 15));
+
+  modifyreg32(I2S_RX_CONF1_REG(port), I2S_RX_MSB_SHIFT_M, I2S_RX_MSB_SHIFT);
+
+  tdm  = getreg32(I2S_RX_TDM_CTRL_REG(port)) & 0xffff0000u;
+  tdm |= FIELD_TO_VALUE(I2S_RX_TDM_TOT_CHAN_NUM, 1);
+  tdm |= g_i2s_rx_slot_mask;
+  putreg32(tdm, I2S_RX_TDM_CTRL_REG(port));
+
+  /* 6. the role.  The self-heal alternates this. */
+
+  if (slave)
+    {
+      modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_SLAVE_MOD);
+    }
+  else
+    {
+      modifyreg32(I2S_RX_CONF_REG(port), I2S_RX_SLAVE_MOD, 0);
+    }
+
+  /* 7. transmitter = the frame clock on the pads, in the clock-only
+   *    shape [V382] / [V725] established: STOP_EN, MONO, CHAN_EQUAL
+   *    and LEFT_ALIGN cleared, the playback TDM frame and PCM2PDM
+   *    values re-latched, then started.  This is the step that a
+   *    finished playback used to skip, leaving the transmitter in the
+   *    playback shape with its FIFO empty. */
+
+  modifyreg32(I2S_TX_CONF_REG(port),
+              I2S_TX_MONO_M | I2S_TX_CHAN_EQUAL_M |
+              I2S_TX_LEFT_ALIGN_M | I2S_TX_STOP_EN_M, 0);
+
+  tdm = FIELD_TO_VALUE(I2S_TX_TDM_TOT_CHAN_NUM, 1) | I2S_TX_TDM_CHAN0_EN;
+
+  if (!g_i2s_tx_mono)
+    {
+      tdm |= I2S_TX_TDM_CHAN1_EN;
+    }
+
+  putreg32(tdm, I2S_TX_TDM_CTRL_REG(port));
+  putreg32(0x004aa004u, I2S_TX_PCM2PDM_CONF_REG(port));
+
+  modifyreg32(I2S_TX_CONF_REG(port), 0, I2S_TX_START);
+  modifyreg32(I2S_TX_CONF_REG(port), 0, I2S_TX_UPDATE);
+
+  for (spins = 0;
+       spins < I2S_UPDATE_SPIN_MAX &&
+       (getreg32(I2S_TX_CONF_REG(port)) & I2S_TX_UPDATE);
+       spins++)
+    {
+    }
+
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_UPDATE);
+
+  for (spins = 0;
+       spins < I2S_UPDATE_SPIN_MAX &&
+       (getreg32(I2S_RX_CONF_REG(port)) & I2S_RX_UPDATE);
+       spins++)
+    {
+    }
+
+  /* 8. receiver on, with the rx_update handshake on both sides of
+   *    rx_start the way [V388] requires. */
+
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_START);
+  modifyreg32(I2S_RX_CONF_REG(port), 0, I2S_RX_UPDATE);
+
+  for (spins = 0;
+       spins < I2S_UPDATE_SPIN_MAX &&
+       (getreg32(I2S_RX_CONF_REG(port)) & I2S_RX_UPDATE);
+       spins++)
+    {
+    }
+
+  if (verbose || g_v858_relocks <= 8 || (g_v858_relocks % 32) == 0)
+    {
+      V1024S(LOG_ERR, "[V858]] relock #%u role=%s rx 0x%08x->0x%08x "
+             "tx 0x%08x->0x%08x tdm=0x%08x conf1=0x%08x\n",
+             (unsigned)g_v858_relocks, slave ? "SLAVE" : "MASTER",
+             (unsigned)rx0,
+             (unsigned)getreg32(I2S_RX_CONF_REG(port)),
+             (unsigned)tx0,
+             (unsigned)getreg32(I2S_TX_CONF_REG(port)),
+             (unsigned)getreg32(I2S_RX_TDM_CTRL_REG(port)),
+             (unsigned)getreg32(I2S_RX_CONF1_REG(port)));
+    }
+}
+
+/* [V858] Called at the top of native_capture_start(), BEFORE the empty
+ * buffers are primed, so the receiver is re-locked while nothing of
+ * ours is in flight and the GDMA inlink cannot be disturbed. */
+
+void esp32s3_i2s_v858_capture_begin(void)
+{
+  struct esp32s3_i2s_s *priv = (struct esp32s3_i2s_s *)g_v690_priv;
+
+  if (priv == NULL)
+    {
+      return;
+    }
+
+  if (i2s_v858_tx_busy(priv) || i2s_v858_rx_busy(priv))
+    {
+      return;
+    }
+
+  i2s_v858_relock(g_v858_rxslave, 0);
+
+  i2s_v908_tick((int)priv->config->port);
+}
+
+/* [V858] Called from audio_playback_close(), which until now only
+ * drained the queue and never touched the port.  Anything the playback
+ * abandoned (a quarantined container after an "I2S TX completion
+ * TIMEOUT", whose DMA descriptor is still linked) is released first,
+ * then the port is put back into the shape it had at boot.
+ *
+ * Skipped while a capture is streaming: that capture re-locks itself on
+ * its next session, and tearing the receiver down under it would cost
+ * it a buffer. */
+
+void esp32s3_i2s_v858_after_playback(void)
+{
+  struct esp32s3_i2s_s *priv = (struct esp32s3_i2s_s *)g_v690_priv;
+
+  if (priv == NULL)
+    {
+      return;
+    }
+
+  if (i2s_v858_rx_busy(priv))
+    {
+      return;
+    }
+
+  esp32s3_i2s_tx_flush();
+
+  i2s_v858_relock(g_v858_rxslave, 0);
+}
+
+/* [V858] Self-heal: flip the receiver's clock role and re-lock.
+ *
+ * Neither role is right on every boot -- the phase between two
+ * free-running dividers decides, and it is set by where each happened
+ * to start.  The only way out of a frozen capture is to move, so each
+ * heal alternates and the [V858] log says which one was in force when
+ * the microphone came back. */
+
+void esp32s3_i2s_v858_heal(void)
+{
+  struct esp32s3_i2s_s *priv = (struct esp32s3_i2s_s *)g_v690_priv;
+
+  if (priv == NULL)
+    {
+      return;
+    }
+
+  g_v858_heals++;
+  g_v858_rxslave = g_v858_rxslave ? 0 : 1;
+
+  i2s_v858_relock(g_v858_rxslave, 1);
+
+  V1024S(LOG_ERR, "[V858]] heal #%u role=%s (heals=%u relocks=%u) rxconf=0x%08x\n",
+         (unsigned)g_v858_heals,
+         g_v858_rxslave ? "SLAVE" : "MASTER",
+         (unsigned)g_v858_heals, (unsigned)g_v858_relocks,
+         (unsigned)getreg32(I2S_RX_CONF_REG(priv->config->port)));
+}
+
+/* [V858b] Re-lock with the role that is in force right now.  This is
+ * the move that cleared the post-playback window in the v858 field
+ * run: the registers were already right, the bit phase was not, and a
+ * fresh start edge draws a new one. */
+
+void esp32s3_i2s_v858_relock_current(void)
+{
+  struct esp32s3_i2s_s *priv = (struct esp32s3_i2s_s *)g_v690_priv;
+
+  if (priv == NULL)
+    {
+      return;
+    }
+
+  i2s_v858_relock(g_v858_rxslave, 0);
+}
+
+uint32_t esp32s3_i2s_v858_rxconf(void)
+{
+  struct esp32s3_i2s_s *priv = (struct esp32s3_i2s_s *)g_v690_priv;
+
+  if (priv == NULL)
+    {
+      return 0;
+    }
+
+  return (uint32_t)getreg32(I2S_RX_CONF_REG(priv->config->port));
 }
 
 /****************************************************************************
@@ -3411,18 +6875,83 @@ static uint32_t i2s_set_datawidth(struct esp32s3_i2s_s *priv)
                   FIELD_TO_VALUE(I2S_RX_HALF_SAMPLE_BITS,
                   priv->data_width - 1));
 
+      /* [V718] Mirror the transmitter -- this condition was inverted.
+       *
+       * For this port audio_std_mode is not I2S_TDM_PCM, so the TX branch
+       * (which has always worked, the speaker is audible) programs
+       * TX_TDM_WS_WIDTH = data_width - 1 = 15, while the RX branch here
+       * programmed 1, i.e. a WS high time of two BCK instead of sixteen.
+       *
+       * The receiver owns WS during capture, so that is the frame the
+       * ES8311 saw, and it drove DIN against the wrong boundary.  Pairing
+       * every [V709] raw dump with its conf1 shows the two outcomes:
+       *
+       *   WS_WIDTH = 15  -> audio (0030 0000 ... 1aa0 4620 e3e8 c2b0 19b0,
+       *                            1bc8 1c28 1c00 1bd8 ..., 24 dumps)
+       *   WS_WIDTH =  1  -> every word in {ffff, 0000, 8000}, 24 dumps
+       *
+       * The second shape is the "fixed digital pattern" chased since v698. */
+
       if (priv->config->audio_std_mode == I2S_TDM_PCM)
         {
           modifyreg32(I2S_RX_CONF1_REG(priv->config->port),
                       I2S_RX_TDM_WS_WIDTH_M,
-                      FIELD_TO_VALUE(I2S_RX_TDM_WS_WIDTH,
-                      priv->data_width - 1));
+                      FIELD_TO_VALUE(I2S_RX_TDM_WS_WIDTH, 1));
         }
       else
         {
           modifyreg32(I2S_RX_CONF1_REG(priv->config->port),
                       I2S_RX_TDM_WS_WIDTH_M,
-                      FIELD_TO_VALUE(I2S_RX_TDM_WS_WIDTH, 1));
+                      FIELD_TO_VALUE(I2S_RX_TDM_WS_WIDTH,
+                      priv->data_width - 1));
+
+          /* [V721] RX_LEFT_ALIGN has to be 0 for 16-bit Philips.
+           *
+           * soc/i2s_reg.h:166 -- I2S_RX_LEFT_ALIGN is RX_CONF bit 15,
+           * reset default 1'b1, and i2s_configure() never writes it, so
+           * this port has been running with it set since bring-up.
+           *
+           * The v721 sweep (every slot restored first, one knob per slot,
+           * two independent runs) isolated it: this field is the ONLY
+           * difference between a dead line and real audio.
+           *
+           *   LEFT_ALIGN = 1  rxconf 0x00089604  70 dumps, medDx 0,
+           *                   corr 0.46, std 1, every word in {0,1,3}
+           *   LEFT_ALIGN = 0  rxconf 0x00081604  64 dumps, medDx 20,
+           *                   corr 0.634, std 42, smooth audio:
+           *                   0000 06f2 0724 0702 0714 071e 073c 073c ...
+           *                   03a8 0388 038a 0382 0388 0382 0398 03c0 ...
+           *
+           * Both runs agree, and the run-2 numbers (medDx 25, std 40)
+           * track run 1, so this is not a one-off.
+           *
+           * TDM keeps the old behaviour: that branch is unused on this
+           * port and left-align is meaningful there. */
+
+          modifyreg32(I2S_RX_CONF_REG(priv->config->port),
+                      I2S_RX_LEFT_ALIGN_M, 0);
+
+          /* [V722] RX_MSB_SHIFT has to stay 1 (Philips).
+           *
+           * soc/i2s_reg.h -- I2S_RX_MSB_SHIFT is RX_CONF1 bit 29,
+           * reset default 1'b1: the one-BCK delay between the WS edge
+           * and the first data bit that the Philips standard requires.
+           * i2s_configure() re-asserts it in its PHILIPS branch, but
+           * the v717 diagnostic block used to clear it at the end of
+           * the same call, and _v721b_boot.log prices the damage:
+           *
+           *   MSB_SHIFT = 1  conf1 0x2f3de38f  64 dumps  medDx 96
+           *                  maxabs 624        real audio
+           *   MSB_SHIFT = 0  conf1 0x0f3de38f  69 dumps  medDx 16384
+           *                  maxabs 32768      {0000,4000,8000,c000}
+           *
+           * Writing it here puts the three framing fields this RX path
+           * depends on -- WS_WIDTH, LEFT_ALIGN, MSB_SHIFT -- in one
+           * place, so the correct setting survives even if the
+           * diagnostic block is removed later. */
+
+          modifyreg32(I2S_RX_CONF1_REG(priv->config->port),
+                      I2S_RX_MSB_SHIFT_M, I2S_RX_MSB_SHIFT);
         }
     }
 #endif /* I2S_HAVE_RX */
@@ -3723,14 +7252,7 @@ static void i2s_tx_irq_mask(struct esp32s3_i2s_s *priv)
 
   if (g_tx_irq_mask_n <= 3)
     {
-      syslog(LOG_INFO,
-             "[V364] tx irq MASK: both queues empty (n=%d) "
-             "ENA=0x%08x ST=0x%08x\n",
-             g_tx_irq_mask_n,
-             (unsigned)GET_GDMA_CH_REG(DMA_OUT_INT_ENA_CH0_REG,
-                                       priv->dma_channel),
-             (unsigned)GET_GDMA_CH_REG(DMA_OUT_INT_ST_CH0_REG,
-                                       priv->dma_channel));
+      
     }
 }
 
@@ -3750,14 +7272,7 @@ static void i2s_tx_irq_unmask(struct esp32s3_i2s_s *priv)
 
   if (g_tx_irq_unmask_n <= 3)
     {
-      syslog(LOG_INFO,
-             "[V364] tx irq UNMASK: buffer queued (n=%d) "
-             "ENA=0x%08x ST=0x%08x\n",
-             g_tx_irq_unmask_n,
-             (unsigned)GET_GDMA_CH_REG(DMA_OUT_INT_ENA_CH0_REG,
-                                       priv->dma_channel),
-             (unsigned)GET_GDMA_CH_REG(DMA_OUT_INT_ST_CH0_REG,
-                                       priv->dma_channel));
+      
     }
 }
 
@@ -3793,13 +7308,7 @@ static void i2s_tx_rate_tick(void)
 
   g_tx_rate_next_ms = now_ms + 5000;
 
-  syslog(LOG_INFO,
-         "[V362] txdma rate/5s: calls=%d starts=%d bail_act=%d "
-         "bail_pend=%d (s1_setup=%d s2_isr=%d) total=%d "
-         "irq_mask=%d irq_unmask=%d\n",
-         g_tx_rate_calls, g_tx_rate_starts, g_tx_rate_bail_act,
-         g_tx_rate_bail_pend, g_tx_rate_bail_s1, g_tx_rate_bail_s2,
-         g_tx_txdma_start_n, g_tx_irq_mask_n, g_tx_irq_unmask_n);
+  
 }
 
 static void i2s_apply_tx_gdma_strategy(struct esp32s3_i2s_s *priv)
@@ -3814,12 +7323,7 @@ static void i2s_apply_tx_gdma_strategy(struct esp32s3_i2s_s *priv)
                    DMA_OUT_CHECK_OWNER_CH0_M);
   SET_GDMA_CH_REG(DMA_OUT_PRI_CH0_REG, priv->dma_channel, 1);
 
-  syslog(LOG_INFO,
-         "[V337] tx gdma strategy applied: CONF0=0x%08x CONF1=0x%08x "
-         "PRI=0x%08x\n",
-         (unsigned)GET_GDMA_CH_REG(DMA_OUT_CONF0_CH0_REG, priv->dma_channel),
-         (unsigned)GET_GDMA_CH_REG(DMA_OUT_CONF1_CH0_REG, priv->dma_channel),
-         (unsigned)GET_GDMA_CH_REG(DMA_OUT_PRI_CH0_REG, priv->dma_channel));
+  
 }
 
 static void i2s_tx_channel_start(struct esp32s3_i2s_s *priv)
@@ -3840,12 +7344,7 @@ static void i2s_tx_channel_start(struct esp32s3_i2s_s *priv)
            * I2S_TX_START is i2s_txdma_start(), instrumented separately.) */
 
           g_tx_channel_start_er++;
-          syslog(LOG_INFO,
-                 "[V347] tx_channel_start EARLY-RETURN: tx_started=%d (n=%d) "
-                 "STATE=0x%08x TXCONF=0x%08x\n",
-                 (int)priv->tx_started, g_tx_channel_start_er,
-                 (unsigned)getreg32(I2S_STATE_REG(priv->config->port)),
-                 (unsigned)getreg32(I2S_TX_CONF_REG(priv->config->port)));
+          
 
           i2swarn("TX channel of port %d was previously started\n",
                   priv->config->port);
@@ -3935,6 +7434,8 @@ static void i2s_tx_channel_start(struct esp32s3_i2s_s *priv)
       modifyreg32(I2S_TX_CONF_REG(priv->config->port), 0, I2S_TX_FIFO_RESET);
       modifyreg32(I2S_TX_CONF_REG(priv->config->port), I2S_TX_FIFO_RESET, 0);
 
+      g_v671_cfg_valid = 0;   /* [V671] TX channel (re)started */
+
       /* Set I2S_RX_UPDATE bit to update the configs.
        * This bit is automatically cleared.
        */
@@ -3961,12 +7462,7 @@ static void i2s_tx_channel_start(struct esp32s3_i2s_s *priv)
                        DMA_OUT_CHECK_OWNER_CH0_M);
       SET_GDMA_CH_REG(DMA_OUT_PRI_CH0_REG, priv->dma_channel, 1);
 
-      syslog(LOG_INFO,
-             "[V336] GDMA strategy re-applied after I2S reset: "
-             "CONF0=0x%08x CONF1=0x%08x PRI=0x%08x\n",
-             (unsigned)GET_GDMA_CH_REG(DMA_OUT_CONF0_CH0_REG, priv->dma_channel),
-             (unsigned)GET_GDMA_CH_REG(DMA_OUT_CONF1_CH0_REG, priv->dma_channel),
-             (unsigned)GET_GDMA_CH_REG(DMA_OUT_PRI_CH0_REG, priv->dma_channel));
+      
 
 
       /* [V221] Wait for tx_update to self-clear, exactly as ESP-IDF's
@@ -4113,6 +7609,77 @@ static void i2s_rx_channel_start(struct esp32s3_i2s_s *priv)
                       0, I2S_RX_SLAVE_MOD);
         }
 
+      /* [V727] *** The receiver has to be a slave.  Insist on it. ***
+       *
+       * I2S_RX_SLAVE_MOD is RX_CONF bit 3 (soc/i2s_reg.h:220, default
+       * 1'b0) and it measured 0 in the steady state (rxconf =
+       * 0x00081604) even though the transmitter owns the pads here:
+       * [V382] runs it as a clock generator, [V386] loops BCK and WS
+       * back into I2S0I_BCK_IN / I2S0I_WS_IN, and the [V390] block
+       * above asks for slave mode whenever g_v390_rxmaster is 0.
+       * Something clears the bit again afterwards.
+       *
+       * With the bit clear the receiver generates its own frame.  The
+       * FREQUENCY is right -- 178 buffers in 11.52 s at 1023 frames per
+       * buffer is 15857 frames/s, and BCK measures 512 kHz -- but the
+       * PHASE is free with respect to the ES8311, so every capture is
+       * the real signal shifted by an arbitrary number of bits and the
+       * shift wanders:
+       *
+       *   {0000,8000}               or=0x0000000f, app peak 15
+       *   {0000,4000,8000,c000}     (v721b)
+       *
+       * Rewriting RX_CONF re-locks the receiver onto a new arbitrary
+       * offset each time (peak 1112..2188 once, 10176..16383 the next),
+       * which is what made this look like a race for so long.
+       *
+       * Measured with the v726 live hook, one write, no reflash
+       * (_work\\_v726_sweep3.log):
+       *
+       *   40..65 s  SLAVE_MOD = 0   or=0x0000000f   peak 15         dead
+       *   70..150 s SLAVE_MOD = 1   or=0x0000ffff   peak 115..1845  real,
+       *                             full 16 bits, stable the whole
+       *                             80-second window
+       *   160..190  SLAVE_MOD = 0   or=0x0000ffc0 -> 0x000003ff
+       *                             peak 7360..32768 then 5..1023   broken
+       *
+       * The [V390] A/B above is untouched, so flipping
+       * g_v390_rxmaster still reaches this line; this just makes the
+       * outcome unconditional, which is what the port needs. */
+
+      modifyreg32(I2S_RX_CONF_REG(priv->config->port),
+                  0, I2S_RX_SLAVE_MOD);
+
+      /* [V913] *** Did the role actually take? ***
+       *
+       * [V727] writes RX_SLAVE_MOD unconditionally here, yet V912
+       * measured rxconf = 0x00081604 (bit3 = 0, master) in the
+       * steady state.  The reason is ordering: i2s_configure() runs
+       * AFTER i2s_rx_channel_start() and its own role block
+       * (g_v390_rxmaster == 1 -> clear the bit) overwrote this one.
+       * With edit 1 that same block now sets the bit, so the two
+       * writers finally agree.
+       *
+       * Runtime contract: rxconf bit3 must read 1 from here on.
+       * Printed once per i2s_rx_channel_start(), first eight only. */
+
+      {
+        static unsigned s_v913_role;
+
+        if (s_v913_role < 8u)
+          {
+            s_v913_role++;
+            V1024S(LOG_INFO, "[V913]] ROLE n=%u role=%s rxconf=0x%08x "
+                   "conf1=0x%08x\n",
+                   s_v913_role,
+                   g_v390_rxmaster ? "MASTER" : "SLAVE",
+                   (unsigned)getreg32(
+                     I2S_RX_CONF_REG(priv->config->port)),
+                   (unsigned)getreg32(
+                     I2S_RX_CONF1_REG(priv->config->port)));
+          }
+      }
+
       /* Reset RX FIFO */
 
       modifyreg32(I2S_RX_CONF_REG(priv->config->port), 0, I2S_RX_FIFO_RESET);
@@ -4142,8 +7709,7 @@ static void i2s_rx_channel_start(struct esp32s3_i2s_s *priv)
           }
 
         g_rx_update_spins = spins;
-        /* [V394] IRQ-stack: silenced */ if (0) syslog(LOG_INFO,
-               "[V390] rx role=%s conf=0x%08x\n",
+        /* [V394] IRQ-stack: silenced */ if (0) V1024S(LOG_INFO, "[V390]] rx role=%s conf=0x%08x\n",
                g_v390_rxmaster ? "MASTER" : "SLAVE",
                (unsigned)getreg32(I2S_RX_CONF_REG(priv->config->port)));
         /* [V394] IRQ-stack: silenced */ if (0) syslog(LOG_INFO,
@@ -4186,6 +7752,56 @@ static void i2s_rx_channel_start(struct esp32s3_i2s_s *priv)
         {
           int spins;
 
+          /* [V725] *** The clock generator has to use the frame playback
+           * uses, not the reset default. ***
+           *
+           * The receiver here is a slave to this transmitter's BCK/WS
+           * ([V382] below), so whatever the TX side does to the frame is
+           * what the ES8311's ADC and the RX shifter both see.  Until
+           * the first transmission nothing has configured that frame,
+           * and the hardware reset default is
+           *
+           *     TX_CONF     bit19 TX_TDM_EN = 1   (TDM mode is on)
+           *     TX_TDM_CTRL 0x0000ffff            (all 16 CHANn_EN)
+           *
+           * The [V724] register diff caught exactly that: across the
+           * first playback window only two registers moved --
+           *
+           *     TX_CONF 0x00089204 -> 0x00089264   (MONO + CHAN_EQUAL)
+           *     TX_TDM  0x0000ffff -> 0x00010001
+           *
+           * -- and the rx stream's effective bit depth changed class at
+           * the same instant.  The values on the right are the ones
+           * i2s_txdma_start() writes on every tx buffer (~1496-1548);
+           * the values on the left are what the clock-only window was
+           * left with.
+           *
+           * So replay that same configuration here, while the
+           * transmitter is still stopped, and the clock-only window
+           * produces the identical frame.  Nothing on the playback path
+           * changes.
+           */
+
+          modifyreg32(I2S_TX_CONF_REG(priv->config->port),
+                      I2S_TX_MONO_M | I2S_TX_CHAN_EQUAL_M |
+                      I2S_TX_LEFT_ALIGN_M | I2S_TX_STOP_EN_M,
+                      0);
+
+          {
+            uint32_t v725tdm = FIELD_TO_VALUE(I2S_TX_TDM_TOT_CHAN_NUM, 1) |
+                               I2S_TX_TDM_CHAN0_EN;
+
+            if (!g_i2s_tx_mono)
+              {
+                v725tdm |= I2S_TX_TDM_CHAN1_EN;
+              }
+
+            putreg32(v725tdm, I2S_TX_TDM_CTRL_REG(priv->config->port));
+          }
+
+          putreg32(0x004aa004u,
+                   I2S_TX_PCM2PDM_CONF_REG(priv->config->port));
+
           modifyreg32(I2S_TX_CONF_REG(priv->config->port), 0,
                       I2S_TX_START);
           modifyreg32(I2S_TX_CONF_REG(priv->config->port), 0,
@@ -4199,7 +7815,7 @@ static void i2s_rx_channel_start(struct esp32s3_i2s_s *priv)
             {
             }
 
-          /* [V394] IRQ-stack: silenced */ if (0) syslog(LOG_INFO, "[V382] tx clock-only start spins=%d "
+          /* [V394] IRQ-stack: silenced */ if (0) V1024S(LOG_INFO, "[V382]] tx clock-only start spins=%d "
                  "txconf=0x%08x\n",
                  spins,
                  (unsigned)getreg32(I2S_TX_CONF_REG(priv->config->port)));
@@ -4253,7 +7869,7 @@ static void i2s_rx_channel_start(struct esp32s3_i2s_s *priv)
                   }
               }
 
-            /* [V394] IRQ-stack: silenced */ if (0) syslog(LOG_INFO, "[V383] pins BCLK(10) hi=%u WS(8) hi=%u "
+            /* [V394] IRQ-stack: silenced */ if (0) V1024S(LOG_INFO, "[V383]] pins BCLK(10) hi=%u WS(8) hi=%u "
                    "DIN(9) hi=%u /4000\n", bhi, whi, dhi);
           }
       }
@@ -4295,6 +7911,8 @@ static void i2s_tx_channel_stop(struct esp32s3_i2s_s *priv)
 
       modifyreg32(I2S_TX_CONF_REG(priv->config->port), I2S_TX_START, 0);
 
+      g_v671_cfg_valid = 0;   /* [V671] transmitter stopped */
+
       /* Stop outlink */
 
       SET_GDMA_CH_BITS(DMA_OUT_LINK_CH0_REG, priv->dma_channel,
@@ -4317,7 +7935,7 @@ static void i2s_tx_channel_stop(struct esp32s3_i2s_s *priv)
       priv->tx_started = false;
       g_tx_cfg_done    = 0;   /* [V346] force reconfig on next activation */
 
-      i2sinfo("Stopped TX channel of port %d\n", priv->config->port);
+      
     }
 }
 #endif /* I2S_HAVE_TX */
@@ -4337,6 +7955,244 @@ static void i2s_tx_channel_stop(struct esp32s3_i2s_s *priv)
  ****************************************************************************/
 
 #ifdef I2S_HAVE_RX
+/* [V697] *** Return every RX buffer that is still in flight. ***
+ *
+ * Called from the capture client's teardown, right after AUDIOIOC_STOP and
+ * BEFORE it frees the ap_buffers, because the alternative is what killed the
+ * board: the abandoned container keeps a pointer to an apb the client is
+ * about to release, and the next DMA or worker write lands on the heap
+ * header that sits directly above the apb's payload.
+ *
+ * Deliberately silent towards the client: es8311_processdone() asserts
+ * priv->running, which is false during a teardown, so handing these buffers
+ * to the worker would turn a leak into a panic.  Dropping the driver's own
+ * reference here is enough -- the client's reference is what
+ * AUDIOIOC_FREEBUFFER / native_free_buffer() releases afterwards.
+ */
+
+static int i2s_rx_release_inflight(struct esp32s3_i2s_s *priv)
+{
+  struct esp32s3_buffer_s *bfcontainer;
+  struct esp32s3_dmadesc_s *bfdesc;
+  irqstate_t flags;
+  int n = 0;
+  int k;
+
+  for (;;)
+    {
+      flags = spin_lock_irqsave(&priv->slock);
+
+      bfcontainer = (struct esp32s3_buffer_s *)sq_remfirst(&priv->rx.act);
+
+      if (bfcontainer == NULL)
+        {
+          bfcontainer = (struct esp32s3_buffer_s *)sq_remfirst(&priv->rx.pend);
+        }
+
+      if (bfcontainer == NULL)
+        {
+          bfcontainer = (struct esp32s3_buffer_s *)sq_remfirst(&priv->rx.done);
+        }
+
+      spin_unlock_irqrestore(&priv->slock, flags);
+
+      if (bfcontainer == NULL)
+        {
+          break;
+        }
+
+      /* Nothing was received into it. */
+
+      bfcontainer->apb->nbytes  = 0;
+      bfcontainer->apb->curbyte = 0;
+      bfcontainer->result       = -EAGAIN;
+
+      /* Clear the EOF marks.  i2s_rx_worker() sums DATALEN over the
+       * descriptors that carry EOF, and a stale mark would make it count
+       * (and copy) bytes the DMA never wrote. */
+
+      bfdesc = bfcontainer->dma_link;
+
+      for (k = 0; k < I2S_DMADESC_NUM && bfdesc != NULL; k++)
+        {
+          bfdesc->ctrl &= ~ESP32S3_DMA_CTRL_EOF;
+          bfdesc = bfdesc->next;
+        }
+
+      /* Drop our reference on the audio buffer, then hand the container
+       * (and the internal-SRAM bounce slot it holds -- i2s_buf_free()
+       * releases that itself) back to their pools. */
+
+      apb_free(bfcontainer->apb);
+      i2s_buf_free(priv, bfcontainer);
+
+      n++;
+    }
+
+  return n;
+}
+
+void esp32s3_i2s_rx_flush(void)
+{
+  struct esp32s3_i2s_s *priv = (struct esp32s3_i2s_s *)g_v690_priv;
+  int n;
+
+  if (priv == NULL || !priv->config->rx_en)
+    {
+      return;
+    }
+
+  /* Stop the receiver FIRST.  Releasing a bounce slot the GDMA is still
+   * writing into would hand it to the next arm while the old transfer is
+   * still landing there. */
+
+  i2s_rx_channel_stop(priv);
+
+  n = i2s_rx_release_inflight(priv);
+
+  V1024S(LOG_INFO, "[V697]] rx flush: %d in-flight buffer(s) released\n", n);
+}
+
+/****************************************************************************
+ * Name: i2s_tx_release_inflight
+ *
+ * Description:
+ *   [V755] TX twin of i2s_rx_release_inflight().  Give back every buffer
+ *   container stranded in the three TX queues, together with the
+ *   internal-SRAM bounce slot each one holds.
+ *
+ *   *** Why this is NOT a copy of the RX version ***
+ *
+ *   On the RX side i2s_receive() takes its own apb_reference() and
+ *   i2s_rx_release_inflight() therefore drops it with apb_free().
+ *   On the TX side i2s_txdma_setup() already called apb_free() at the
+ *   end of the setup, so by the time a container sits in tx.act the
+ *   apb is kept alive ONLY by the es8311 upper half's own reference.
+ *   Ownership must go back through es8311_processdone(), which moves
+ *   it to priv->doneq and decrements inflight; es8311_returnbuffers()
+ *   then drops the last reference.
+ *
+ *   Calling apb_free() here as well would double-free -- the very same
+ *   class of bug v753 created by zeroing priv->inflight on the RX side
+ *   (it panicked the board on its first real execution, EXCCAUSE=001d).
+ *   Skipping the callback instead would leave inflight stuck above
+ *   zero, so the es8311 worker could never exit and would be
+ *   "abandoned" again -- the loop this patch exists to break.
+ *
+ * Assumptions:
+ *   The caller has already stopped the GDMA TX channel.  Handing a
+ *   bounce slot to the next transfer while the old one is still
+ *   landing in it corrupts both.
+ *
+ * Returned Value:
+ *   Number of containers reclaimed.
+ ****************************************************************************/
+
+#ifdef I2S_HAVE_TX
+static int i2s_tx_release_inflight(struct esp32s3_i2s_s *priv)
+{
+  struct esp32s3_buffer_s *bfcontainer;
+  irqstate_t flags;
+  volatile int n = 0;
+
+  for (;;)
+    {
+      flags = spin_lock_irqsave(&priv->slock);
+
+      bfcontainer = (struct esp32s3_buffer_s *)sq_remfirst(&priv->tx.act);
+
+      if (bfcontainer == NULL)
+        {
+          bfcontainer = (struct esp32s3_buffer_s *)sq_remfirst(&priv->tx.pend);
+        }
+
+      if (bfcontainer == NULL)
+        {
+          bfcontainer = (struct esp32s3_buffer_s *)sq_remfirst(&priv->tx.done);
+        }
+
+      spin_unlock_irqrestore(&priv->slock, flags);
+
+      if (bfcontainer == NULL)
+        {
+          break;
+        }
+
+      /* Report the transfer as aborted and hand the apb back through the
+       * upper half's own bookkeeping (doneq + inflight--).
+       * See the header comment: NO apb_free() here. */
+
+      bfcontainer->result = -EAGAIN;
+
+      if (bfcontainer->callback != NULL)
+        {
+          bfcontainer->callback(&priv->dev, bfcontainer->apb,
+                                bfcontainer->arg, bfcontainer->result);
+        }
+
+      /* Release the internal-SRAM bounce slot, then the container
+       * itself.  i2s_buf_free() would release a non-NULL buf anyway;
+       * doing it explicitly keeps the two resources visibly paired. */
+
+      i2s_dmabuf_release(bfcontainer->buf);
+      bfcontainer->buf = NULL;
+
+      i2s_buf_free(priv, bfcontainer);
+
+      n++;
+    }
+
+  return n;
+}
+
+/****************************************************************************
+ * Name: esp32s3_i2s_tx_flush
+ *
+ * Description:
+ *   [V755] Reclaim every stalled TX buffer container so the shared
+ *   internal-SRAM bounce pool can be reused by the capture path.
+ *
+ *   Safe to call at any time: it returns without touching a single
+ *   register when all three TX queues are empty, so a playback that is
+ *   genuinely in flight is never torn down.
+ ****************************************************************************/
+
+void esp32s3_i2s_tx_flush(void)
+{
+  struct esp32s3_i2s_s *priv = (struct esp32s3_i2s_s *)g_v690_priv;
+  volatile int n;
+
+  if (priv == NULL || !priv->config->tx_en)
+    {
+      return;
+    }
+
+  /* Nothing to reclaim => leave the transmitter alone. */
+
+  if (sq_empty(&priv->tx.act) &&
+      sq_empty(&priv->tx.pend) &&
+      sq_empty(&priv->tx.done))
+    {
+      return;
+    }
+
+  /* Stop the transmitter FIRST, for the same reason
+   * esp32s3_i2s_rx_flush() stops the receiver: releasing a bounce slot
+   * the GDMA is still reading from would hand it to the next transfer
+   * while the old one is still in progress. */
+
+  i2s_tx_channel_stop(priv);
+
+  n = i2s_tx_release_inflight(priv);
+
+  V1024S(LOG_INFO, "[V755]] tx flush: %d stalled buffer(s) released "
+         "(bounce_now=%d)\n",
+         (int)n,
+         (int)(g_i2s_dmabuf_used[0] + g_i2s_dmabuf_used[1] +
+               g_i2s_dmabuf_used[2] + g_i2s_dmabuf_used[3]));
+}
+#endif /* I2S_HAVE_TX */
+
 static void i2s_rx_channel_stop(struct esp32s3_i2s_s *priv)
 {
   if (priv->config->rx_en)
@@ -4617,6 +8473,11 @@ static int i2s_txchannels(struct i2s_dev_s *dev, uint8_t channels)
 
       priv->channels = channels;
 
+      /* [V668] Remember it.  priv->channels itself is shared with the RX half
+       * (i2s_rxchannels() writes the same field), so it cannot be used later
+       * as the authority on how the transmitter should be configured. */
+      g_i2s_tx_mono = (channels == 1) ? 1 : 0;
+
       /* Always consider two channels. For mono (1-channel), we set the
        * I2S_TX_TDM_CHAN1_EN to 0 and I2S_TX_CHAN_EQUAL to 1 to send out
        * the data of the previous channel.
@@ -4694,6 +8555,7 @@ static int i2s_rxchannels(struct i2s_dev_s *dev, uint8_t channels)
         }
 
       priv->channels = channels;
+      g_i2s_rx_mono = (channels == 1) ? 1 : 0;   /* [V681] */
       return OK;
     }
 
@@ -4749,6 +8611,73 @@ static uint32_t i2s_txsamplerate(struct i2s_dev_s *dev, uint32_t rate)
 
       i2s_tx_channel_start(priv);
 
+      /* [V664] *** Restore the channel mode that the reset just dropped. ***
+       *
+       * i2s_clock_source_bringup() -> i2s_clock_try_source() pulses
+       * I2S_TX_RESET, and that clears I2S_TX_MONO / I2S_TX_CHAN_EQUAL out
+       * of I2S_TX_CONF as well.  The comment inside i2s_clock_try_source()
+       * claims tx_reset leaves the configuration registers alone -- it does
+       * not.  Measured [V663] with TX already running:
+       *
+       *     I2S_TXCHANNELS(1) then I2S_TXSAMPLERATE(16000)
+       *     TX_CONF = 0x00081204   -> bit5 (MONO) = 0, bit6 (CHAN_EQUAL) = 0
+       *     TX_TDM_CTRL = 0x00010001 -> TOT_CHAN_NUM = 1, CHAN0_EN = 1
+       *
+       * The TDM half proves i2s_txchannels() did run, so the two CONF bits
+       * were written and then wiped here.
+       *
+       * Consequences of running stereo with mono PCM: the hardware takes
+       * TWO 16-bit samples out of the FIFO per LRCK frame (one per slot),
+       * so 30720 samples are consumed in 15360 frames instead of 30720 and
+       * the clip plays at exactly 2x -- pitch up an octave, speech at double
+       * speed, which is the field report.  (30720/2/16000 = 0.960 s,
+       * matching the 1.005 s v663 measured for the whole 61440 B.)
+       *
+       * i2s_txchannels() has already stored priv->channels, so put the two
+       * bits back here -- after every reset, before anything can be queued.
+       * channels == 0 means nobody ever asked, so leave the default alone. */
+
+      if (priv->channels == 1)
+        {
+          modifyreg32(I2S_TX_CONF_REG(priv->config->port),
+                      I2S_TX_MONO_M, I2S_TX_MONO);
+          modifyreg32(I2S_TX_CONF_REG(priv->config->port),
+                      I2S_TX_CHAN_EQUAL_M, I2S_TX_CHAN_EQUAL);
+          modifyreg32(I2S_TX_CONF_REG(priv->config->port), 0, I2S_TX_UPDATE);
+
+        }
+      else if (priv->channels == 2)
+        {
+          modifyreg32(I2S_TX_CONF_REG(priv->config->port),
+                      I2S_TX_MONO_M, 0);
+          modifyreg32(I2S_TX_CONF_REG(priv->config->port),
+                      I2S_TX_CHAN_EQUAL_M, 0);
+          modifyreg32(I2S_TX_CONF_REG(priv->config->port), 0, I2S_TX_UPDATE);
+        }
+
+      /* [V662] *** Playback-rate forensics: what is LRCK really? ***
+       *
+       * The field report is "TTS speaks much too fast, unintelligible".
+       * Every candidate cause collapses onto one quantity: the real LRCK
+       * frequency of I2S0 TX.  What i2s_txsamplerate() returns is only
+       * the nominal value i2s_set_clock() recomputes from its own
+       * assumptions (sclk, total_slot, data_width, bclk_div) -- if any of
+       * those disagrees with the hardware, it still cheerfully reports
+       * 16000.  So print three mutually independent groups of facts:
+       *
+       *   1) driver state        rate / mclk_freq / data_width / channels /
+       *                          total_slot / role / g_i2s_sclk / clk_sel
+       *   2) TX hardware regs    conf (BITS_MOD) / conf1 (BCK_DIV_NUM) /
+       *                          clkm_conf / clkm_div_conf / tdm_ctrl
+       *   3) measured pin edges  WS(GPIO8) and BCLK(GPIO10), CCOUNT timebase
+       *
+       * The TX clock keeps running with no data queued, so this can be
+       * sampled right here, before the first ap_buffer is ever sent.
+       *
+       * Interpretation: 16000 -> I2S is innocent, look at the data path.
+       * ~32000 -> one level forgot a factor of two (bits_mod / bck_div).
+       * ~24000 -> sclk is really the 240 MHz PLL, not 160 MHz.
+       */
       return rate;
     }
 
@@ -4778,6 +8707,30 @@ static uint32_t i2s_rxsamplerate(struct i2s_dev_s *dev, uint32_t rate)
 
   if (priv->config->rx_en)
     {
+      /* [V697] See i2s_rxdatawidth(): a configure that asks for the rate we
+       * are already running at must not stop the receiver.  The capture and
+       * the playback instance share one I2S port, so every TTS session
+       * reconfigures it, and each of those reconfigures used to kill the
+       * capture engine and strand a buffer. */
+
+      if (priv->rx_started && priv->rate == rate)
+        {
+          return rate;
+        }
+
+      /* [V903] CFG3 -- rate change tears the receiver down. */
+      {
+        static unsigned s_v903_c3;
+        int v903p = (int)priv->config->port;
+
+        V1024S(LOG_INFO, "[V903]] CFG3 rxsamplerate #%u %u->%u bits=%u "
+               "rxconf=0x%08x conf1=0x%08x\n",
+               ++s_v903_c3, (unsigned)priv->rate, (unsigned)rate,
+               (unsigned)priv->data_width,
+               (unsigned)getreg32(I2S_RX_CONF_REG(v903p)),
+               (unsigned)getreg32(I2S_RX_CONF1_REG(v903p)));
+      }
+
       i2s_rx_channel_stop(priv);
 
       priv->rate = rate;
@@ -4859,6 +8812,68 @@ static uint32_t i2s_rxdatawidth(struct i2s_dev_s *dev, int bits)
 
   if (priv->config->rx_en)
     {
+      /* [V726] *** Live register hook, read in TASK context. ***
+   *
+   * es8311_configure() calls this function on every configure, and the
+   * log shows one configure per listening cycle (~20 s), so this is the
+   * first place that is both live and safe.
+   *
+   * It is deliberately NOT in the rx completion path.  v724 tried that
+   * and the board panicked on every single boot at t = 24.5 s,
+   * pc=421f9382 (getumask, `l32i.n a2, a2, 24`, vaddr=0x1a because a2
+   * had been loaded from a8=0x3fc92000, 0x50 below the hpwork stack
+   * base 0x3fc92050), task hpwork, chain
+   * work_thread -> fopen -> open -> nx_vopen.  Compiling the two fopen
+   * calls out made the panic disappear for the whole 120 s run.
+   * File I/O does not belong on the work queue on this port.
+   *
+   * Cost: a candidate written here takes effect at the NEXT configure,
+   * about twenty seconds later.  Worth it -- the alternative is a
+   * rebuild and a reflash per hypothesis.
+   *
+   *   echo "RX_CONF1 0x0f3de38f" > /tmp/i2sw.txt    # MSB_SHIFT = 0
+   *   echo 1 > /tmp/pins.txt                        # probe the pins
+   */
+
+  i2s_v724_hook(priv->config->port);
+  i2s_v724_pins();
+
+  /* [V697] *** Nothing to do is not a reason to tear the engine down. ***
+       *
+       * The stop/start below aborts whatever transfer is in flight, and the
+       * container it was given is then abandoned in priv->rx.act for ever
+       * (i2s_rxdma_start() bails out with OK while rx.act is non-empty, so
+       * no buffer is ever armed again).  es8311_configure() calls this on
+       * EVERY configure -- playback included -- and the value is almost
+       * always the same one, so the abort used to happen several times per
+       * PTT session and the second capture never started:
+       *
+       *   [R36]   I2S RX rate 16000 -> 16000
+       *   [V690]  rx recv=6 start=10 eof=4 isr=4 pb=6 done=0 pend=1
+       *           act=1 done_q=0 slot=0x01 bounce=2
+       *
+       * Leaving the running engine alone when the width has not changed is
+       * also what keeps priv->rx_started true, which is the state this
+       * function is supposed to maintain. */
+
+      if (priv->rx_started && priv->data_width == bits)
+        {
+          return (uint32_t)bits;
+        }
+
+      /* [V903] CFG4 -- data-width change tears the receiver down. */
+      {
+        static unsigned s_v903_c4;
+        int v903p = (int)priv->config->port;
+
+        V1024S(LOG_INFO, "[V903]] CFG4 rxdatawidth #%u %u->%d sr=%u "
+               "rxconf=0x%08x conf1=0x%08x\n",
+               ++s_v903_c4, (unsigned)priv->data_width, bits,
+               (unsigned)priv->rate,
+               (unsigned)getreg32(I2S_RX_CONF_REG(v903p)),
+               (unsigned)getreg32(I2S_RX_CONF1_REG(v903p)));
+      }
+
       i2s_rx_channel_stop(priv);
 
       priv->data_width = bits;
@@ -4919,6 +8934,70 @@ static int i2s_send(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
 
       nbytes -= (nbytes % (priv->data_width / 8));
 
+      /* [V810] Transmit-side sample dump.
+       *
+       * The speaker is audible with the right words and a hiss underneath, and
+       * everything measured so far describes the microphone: [V716]'s window OR
+       * and [V718]'s peak both sit on the RX path, and the RX register file reads
+       * 0x2f3de38f on every one of 146 captures, which is the healthy setting.
+       * So the input side is clean and the hiss is being generated downstream of
+       * it -- but nothing in the build looks at what is actually handed to the
+       * transmitter.
+       *
+       * That is the gap this closes.  The first sixteen 16-bit words show
+       * whether the samples are plausible audio at all, and the low-zero count
+       * is the same test the RX side already uses (a receiver that latched the
+       * frame k bits early leaves k low zeros; the transmitter being fed a
+       * stream that was shifted the same way would show the same signature).
+       *
+       * Diagnosis only: nothing here is written back, and the count is bounded so
+       * the log stays readable.
+       *
+       * [V810b] Field names were wrong on the first attempt: ap_buffer_s carries
+       * the data in `samp` (not `sample`) and the driver spells the channel
+       * count `channels` (not `txchannels`).  Guessing member names costs a
+       * build cycle; reading the struct costs one grep. */
+      {
+        static uint32_t v810_bufs;
+
+        if ((v810_bufs++ % 32u) == 1u)
+          {
+            const int16_t *w   = (const int16_t *)apb->samp;
+            uint32_t       orv = 0;
+            int            loz = -1;
+            int            i;
+
+            for (i = 0; i < 16 && (uint32_t)(i * 2 + 1) < apb->nbytes; i++)
+              {
+                orv |= (uint32_t)(uint16_t)w[i];
+              }
+
+            if (orv != 0)
+              {
+                loz = 0;
+
+                while ((orv & 1u) == 0u && loz < 16)
+                  {
+                    orv >>= 1;
+                    loz++;
+                  }
+              }
+
+            V1024S(LOG_INFO, "[V810]] TX nbytes=%u width=%u ch=%u or=0x%08x lowzero=%d "
+                   "samples:", (unsigned)nbytes,
+                   (unsigned)priv->data_width,
+                   (unsigned)(priv->channels ? priv->channels : 1),
+                   (unsigned)orv, loz);
+
+            for (i = 0; i < 16 && (uint32_t)(i * 2 + 1) < apb->nbytes; i++)
+              {
+                syslog(LOG_INFO, "%04x ", (unsigned)(uint16_t)w[i]);
+              }
+
+            syslog(LOG_INFO, "\n");
+          }
+      }
+
       if (nbytes > (ESP32S3_DMA_BUFLEN_MAX * I2S_DMADESC_NUM))
         {
           i2serr("Required buffer size can't fit into DMA outlink "
@@ -4934,7 +9013,32 @@ static int i2s_send(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
       if (bfcontainer == NULL)
         {
           i2serr("Failed to allocate the buffer container");
-          return -ENOMEM;
+
+          /* [V755] *** This is where the capture actually dies. ***
+           *
+           * There are only CONFIG_ESP32S3_I2S_MAXINFLIGHT=4 buffer
+           * containers in total and they are shared with the TX path.
+           * A playback that was abandoned (es8311 worker did not exit)
+           * leaves its containers parked in priv->tx.act / priv->tx.pend
+           * for ever; measured steady state on this board is
+           * txa=1 txp=3, i.e. all four.  Every capture then fails right
+           * here with -ENOMEM before it ever reaches
+           * i2s_rxdma_setup(), which the upper half reports as
+           * "capture EIO" and turns into an endless
+           * "listen: no speech for 8000 ms, restarting session" loop.
+           *
+           * v755 hung the reclaim on the bounce-slot failure further
+           * down and it therefore never ran (0 flushes in 150 s while
+           * xfer ret=-12 fired 7 times).  Reclaim here, on the line
+           * that actually fails, and try once more. */
+
+          esp32s3_i2s_tx_flush();
+
+          bfcontainer = i2s_buf_allocate(priv);
+          if (bfcontainer == NULL)
+            {
+              return -ENOMEM;
+            }
         }
 
       /* Get exclusive access to the I2S driver data */
@@ -5022,21 +9126,13 @@ static int i2s_send(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
            * per-event counters.  g_tx_isr_status == 0 with txirqN > 0 would
            * mean the interrupt came from somewhere other than OUT_INT_ST. */
 
-          syslog(LOG_INFO,
-                 "[V342] tx_isr: raw_status=0x%08x done=%u eof=%u "
-                 "dsc_err=%u total_eof=%u txirqN=%d\n",
-                 (unsigned)g_tx_isr_status, g_tx_isr_n[0], g_tx_isr_n[1],
-                 g_tx_isr_n[2], g_tx_isr_n[3], g_txirq_n);
+          
 
           /* [V345] Completion-path accounting: how many ISR schedules ran,
            * how many found an empty tx.act, how many matched the descriptor,
            * and how many actually reached the user callback. */
 
-          syslog(LOG_INFO,
-                 "[V345] tx_done path: sched=%u noact=%u match=%u "
-                 "worker=%u cb=%u\n",
-                 g_sched_n, g_sched_noact, g_sched_match,
-                 g_worker_n, g_worker_cb);
+          
           syslog(LOG_INFO,
                  "[I2SREG] desc0.ctrl=0x%08x OWNER(bit31)=%d EOF(bit30)=%d "
                  "len=%u dma_link=%p buf=%p\n", (unsigned)d0,
@@ -5134,18 +9230,7 @@ static int i2s_send(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
    * full the peripheral is not accepting data; if OUTFIFO is empty the
    * peripheral never asked for any. */
 
-  syslog(LOG_INFO,
-         "[I2SREG] FSM: DSCR=0x%08x OUTFIFO=0x%08x STATE=0x%08x "
-         "CONF0=0x%08x CONF1=0x%08x PRI=0x%08x EOFDES=0x%08x\n",
-         (unsigned)GET_GDMA_CH_REG(DMA_OUT_DSCR_CH0_REG, priv->dma_channel),
-         (unsigned)GET_GDMA_CH_REG(DMA_OUTFIFO_STATUS_CH0_REG,
-                                   priv->dma_channel),
-         (unsigned)GET_GDMA_CH_REG(DMA_OUT_STATE_CH0_REG, priv->dma_channel),
-         (unsigned)GET_GDMA_CH_REG(DMA_OUT_CONF0_CH0_REG, priv->dma_channel),
-         (unsigned)GET_GDMA_CH_REG(DMA_OUT_CONF1_CH0_REG, priv->dma_channel),
-         (unsigned)GET_GDMA_CH_REG(DMA_OUT_PRI_CH0_REG, priv->dma_channel),
-         (unsigned)GET_GDMA_CH_REG(DMA_OUT_EOF_DES_ADDR_CH0_REG,
-                                   priv->dma_channel));
+  
 
   /* [V344] The V260 TDM-slot / mono sweep that used to run here has been
    * removed.  It was a one-shot experiment, but it did lasting damage:
@@ -5210,6 +9295,8 @@ static int i2s_receive(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
 {
   g_v94_recv++;
   struct esp32s3_i2s_s *priv = (struct esp32s3_i2s_s *)dev;
+
+  g_v690_priv = priv;   /* [V690] for the rx health beacon */
 
   if (priv->config->rx_en)
     {
@@ -5298,6 +9385,25 @@ errout_with_buf:
  *   OK on success; A negated errno value on failure.
  *
  ****************************************************************************/
+
+/* [V671] Export the transfer-path counters so the playback layer can print
+ * one line per utterance.  "full" counts transfers that had to reconfigure and
+ * reset the transmitter; "light" counts the ones that only re-armed the DMA.
+ * A healthy session is full == 1 and light == (transfers - 1).
+ */
+
+void esp32s3_i2s_v671_stats(uint32_t *full, uint32_t *light)
+{
+  if (full != NULL)
+    {
+      *full = (uint32_t)g_v671_full_n;
+    }
+
+  if (light != NULL)
+    {
+      *light = (uint32_t)g_v671_light_n;
+    }
+}
 
 static int i2s_ioctl(struct i2s_dev_s *dev, int cmd, unsigned long arg)
 {
@@ -5434,24 +9540,20 @@ static int i2s_dma_setup(struct esp32s3_i2s_s *priv)
     uint32_t c0o = getreg32(DMA_OUT_PERI_SEL_CH0_REG);
     uint32_t c0i = getreg32(DMA_IN_PERI_SEL_CH0_REG);
 
-    syslog(LOG_INFO,
-           "[V267] dma_request -> ch%d; ch0 PSELout=0x%x PSELin=0x%x\n",
-           priv->dma_channel, (unsigned)c0o, (unsigned)c0i);
+    
 
     if (priv->dma_channel != 0 && c0o == 3u && c0i == 3u)
       {
         SET_GDMA_CH_REG(DMA_OUT_PERI_SEL_CH0_REG, 0, 0x3fu);
         SET_GDMA_CH_REG(DMA_IN_PERI_SEL_CH0_REG, 0, 0x3fu);
-        syslog(LOG_INFO,
-               "[V268] ch0 was also bound to I2S0 -- unbound, I2S0 now served "
-               "only by ch%d\n", priv->dma_channel);
+        
       }
     else if (priv->dma_channel != 0 && c0o == 0x3fu && c0i == 0x3fu)
       {
         priv->dma_channel = 0;
         SET_GDMA_CH_REG(DMA_OUT_PERI_SEL_CH0_REG, 0, 3u);
         SET_GDMA_CH_REG(DMA_IN_PERI_SEL_CH0_REG, 0, 0x3fu);
-        syslog(LOG_INFO, "[V268] moved the I2S onto free GDMA channel 0\n");
+        
       }
   }
 

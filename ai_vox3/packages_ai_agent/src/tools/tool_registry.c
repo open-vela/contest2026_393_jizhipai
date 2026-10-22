@@ -42,6 +42,7 @@
 #include "tools/tool_vision.h"
 #include "tools/tool_camera.h"
 #include "tools/tool_web_search.h"
+#include "tools/tool_mijia.h"
 #include "agent_compat.h"
 #include "agent_config.h"
 
@@ -51,7 +52,7 @@
 
 static const char* TAG = "tools";
 
-#define MAX_TOOLS 48
+#define MAX_TOOLS 56   /* [W962] was 48; +2 for the Mi-home tools */
 #define MAX_PROVIDERS 4
 
 /* ── External tool provider registry ───────────────────────── */
@@ -84,6 +85,7 @@ void tool_registry_register_provider(const char* name,
     s_providers[s_provider_count].get_tools = get_tools;
     s_providers[s_provider_count].execute = execute;
     s_provider_count++;
+    s_tools_dirty = true;   /* [V853] same reasoning as register_tool() */
     syslog(LOG_INFO, "[%s] Registered tool provider: %s\n", TAG, name);
 }
 
@@ -94,6 +96,11 @@ static void register_tool(const agent_tool_t* tool)
         return;
     }
     s_tools[s_tool_count++] = *tool;
+    /* [V853] Invalidate the cached JSON: build_tools_json_locked() short-
+     * circuits on !s_tools_dirty, so without this the first reader froze
+     * whatever had been registered at that instant and the rebuild at the
+     * end of tool_registry_init() became a no-op. */
+    s_tools_dirty = true;
     syslog(LOG_INFO, "[%s] Registered tool: %s\n", TAG, tool->name);
 }
 
@@ -280,6 +287,30 @@ int tool_registry_init(void)
         "Fetch current weather via Open-Meteo (no API key) and write it to /tmp/weather.txt for the info screen.",
         TOOL_NO_PARAMS,
         tool_refresh_weather_execute);
+    /* [W962] Mi-home control.  Both tools read everything they need
+     * (gateway host/token and the device list) from /data/mijia/config.json
+     * at call time, so no credential is baked into the image. */
+    REGISTER_TOOL_NO_PARAMS(
+        "mijia_list",
+        "List the Mi-home (Mi Home / Xiaomi smart home) devices that can "
+        "be controlled from this device.",
+        tool_mijia_list_execute);
+
+    REGISTER_TOOL(
+        "mijia_set",
+        "Turn a Mi-home device on or off, or set its level. Use "
+        "mijia_list first to get the device name.",
+        TOOL_SCHEMA_BEGIN()
+            TOOL_PARAM_STR("name",
+                "Device name or entity id, e.g. 'desk lamp' or "
+                "'light.desk'") ","
+            TOOL_PARAM_STR("action",
+                "'on', 'off', 'toggle', or 'set' (set needs value)") ","
+            TOOL_PARAM_NUM("value",
+                "Level 0..100 percent, used with action='set'")
+            TOOL_SCHEMA_END_REQUIRED("\"name\""),
+        tool_mijia_set_execute);
+
     weather_tool_init();
 
     /* Todo tool: the info screen carousel shows /tmp/todo.txt */

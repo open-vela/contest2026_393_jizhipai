@@ -54,6 +54,7 @@ FAR struct i2s_dev_s    *esp32s3_i2sbus_initialize(int port);
 #include <semaphore.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>          /* [V710] FILE/fopen/fgetc/fclose for /tmp/pp.txt */
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
@@ -83,6 +84,12 @@ FAR struct i2s_dev_s    *esp32s3_i2sbus_initialize(int port);
 static const char *TAG = "audio_direct";
 static int g_tx_timeouts;
 
+/* [V671] Path counters exported by esp32s3_i2s.c.  "full" counts transfers
+ * that had to reconfigure and reset the transmitter, "light" the ones that
+ * only re-armed the DMA.  A stutter fix that silently fell back to the old
+ * per-buffer reset would show up here as light == 0. */
+void esp32s3_i2s_v671_stats(uint32_t *full, uint32_t *light);
+
 static struct i2c_master_s *g_i2c;
 static struct i2s_dev_s    *g_i2s;
 static bool                 g_inited;
@@ -94,11 +101,45 @@ struct audio_playback
 
 /* ---- ES8311 I2C helpers ---- */
 
+/* [V856] Snapshot of the register file as written by the ONE init that
+ * verified.
+ *
+ * es8311_dac_init() is a 15-step read-modify-write chain and it is run
+ * on EVERY audio_playback_open() -- i.e. before every single TTS reply.
+ * Any one of those reads returning a bad byte writes that byte straight
+ * back into the codec, and reg 0x14 of the chain is the "analogue mic,
+ * not digital" bit: one bad read and the microphone goes silent while
+ * every I2S register still looks perfect.
+ *
+ * That is the shape of the report -- works once, dead afterwards.
+ *
+ * So: run the real init once, remember every value it settled on, and
+ * replay those values on later opens.  A replay is all absolute writes,
+ * so there is no read left to get wrong. */
+#define ES_SNAP_N 0x50
+static uint8_t g_es_snap[ES_SNAP_N];
+static uint8_t g_es_seen[ES_SNAP_N];
+static int     g_es_snap_n;
+static int     g_es_snap_ok;
+static int     g_es_recording;
+
 static int g_i2c_errs;
 
 static void es_writereg(uint8_t reg, uint8_t val)
 {
   int rc;
+
+  /* [V856] Remember the last value written to each register while the
+   * one real init is running. */
+  if (g_es_recording && reg < ES_SNAP_N)
+    {
+      if (!g_es_seen[reg])
+        {
+          g_es_seen[reg] = 1;
+          g_es_snap_n++;
+        }
+      g_es_snap[reg] = val;
+    }
 
   if (!g_i2c)
     {
@@ -142,12 +183,128 @@ static uint8_t es_readreg(uint8_t reg)
       .addrlen   = 7
     };
 
-  i2c_write(g_i2c, &cfg, &w, 1);
-  i2c_read(g_i2c, &cfg, &r, 1);
+  /* [V854] Both return codes used to be thrown away, so a failed transfer
+   * silently returned whatever happened to be in r.  Every read-modify-
+   * write in es8311_dac_init() then wrote that value straight back into
+   * the codec -- including reg 0x14 ("analogue mic, not digital"), which
+   * is how the microphone ended up reading pure silence while i2c_errs
+   * still reported 0.  Check the codes and retry before giving up.
+   */
+  {
+    int attempt;
+    uint8_t prev = 0xff;
+
+    /* [V855] v854 stopped throwing the return codes away, but a transfer
+     * that reports success can still carry a corrupt byte -- the v853
+     * captures had i2c_errs == 0 next to r00=0xff.  Require two
+     * consecutive reads to agree before the value is trusted, because
+     * every use of it is a read-modify-write: one bad byte is written
+     * straight back into the codec, and reg 0x14 of those is exactly the
+     * "analogue mic" bit that leaves the microphone silent. */
+    for (attempt = 0; attempt < 8; attempt++)
+      {
+        int rc = i2c_write(g_i2c, &cfg, &w, 1);
+
+        if (rc < 0)
+          {
+            usleep(1000);
+            continue;
+          }
+
+        rc = i2c_read(g_i2c, &cfg, &r, 1);
+
+        if (rc < 0)
+          {
+            usleep(1000);
+            continue;
+          }
+
+        if (r == prev)
+          {
+            return r;
+          }
+
+        prev = r;
+      }
+  }
+
   return r;
 }
 
 /* Program ES8311 for DAC playback using the proven register sequence. */
+/* [V811] Alternating DAC mute, to place the hiss on one side of the codec.
+ *
+ * Every digital measurement comes back clean: RX registers 0x2f3de38f on all
+ * 146 captures, RX data OR 0x0000ffff (the driver's own classifier calls that
+ * good), and the TX stream v810 dumps is an ordinary signed waveform.  I2C
+ * reports no errors and v248's five register fixes are all in place.
+ *
+ * What that cannot separate is a hiss made inside the DAC from one made after
+ * it -- amplifier, speaker wiring, supply.  At the speaker the two are
+ * indistinguishable, and everything measured so far sits upstream of the split.
+ *
+ * So alternate it.  Four seconds on, four seconds off, forever, while the
+ * playback stream keeps running untouched.  Listen across a transition:
+ *
+ *   hiss present in BOTH phases  -> nothing upstream is responsible;
+ *                                    it is after the codec (analogue or board)
+ *   hiss present only when on   -> it is inside the codec or before it
+ *
+ * The stream is never stopped, because stopping playback would change the
+ * DAC's operating state and destroy the comparison.  Enabled only when
+ * CONFIG_AI_AGENT_AUDIO_DAC_MUTE_ALT is set, so it costs nothing normally.
+ */
+/* [V811e] Not guarded by a config symbol on purpose.  The configuration for
+ * this build is injected rather than declared in Kconfig (there is no entry for
+ * it anywhere in the tree), so an #ifdef here would never be true and the whole
+ * diagnostic would be dead code -- which is the mistake this comment exists to
+ * prevent.  Remove this block once the split has been made. */
+extern int es8311_ext_setmute(int mute);
+/* [V858] Put the port back into its boot shape once this playback is over. */
+extern void esp32s3_i2s_v858_after_playback(void);
+static void v811_mute_alternate(void)
+{
+  /* [V811f] Phase counter starts at 0 on the first call so the very first
+   * switch leaves the DAC open -- an experiment that opens with the output
+   * muted reads as "no hiss at all" and wastes a listening pass. */
+  static unsigned s_phase;
+
+  if (s_phase == 0u)
+    {
+      es8311_ext_setmute(0);
+      syslog(LOG_ERR,
+             "[V811c] phase 0: DAC open (baseline for the comparison)\n");
+      s_phase = 1u;
+      return;
+    }
+
+  es8311_ext_setmute(s_phase & 1);
+  syslog(LOG_ERR,
+         "[V811c] phase %d: DAC %s (stream continues unchanged)\n",
+         s_phase & 1, (s_phase & 1) ? "MUTED" : "open");
+  s_phase++;
+}
+
+/* [V856] Re-apply every register the verified init settled on, in
+ * ascending register order.  Pure writes: no read can go wrong, so the
+ * microphone cannot be clobbered by this path.
+ *
+ * Writing 0x00 (0x80) part-way through resets the codec, which is fine:
+ * every remaining register is written right after it with exactly the
+ * value the full sequence produced, so the end state is identical. */
+static void es8311_replay_snapshot(void)
+{
+  int i;
+
+  for (i = 0; i < ES_SNAP_N; i++)
+    {
+      if (g_es_seen[i])
+        {
+          es_writereg((uint8_t)i, g_es_snap[i]);
+        }
+    }
+}
+
 static void es8311_dac_init(void)
 {
   uint8_t rv;
@@ -300,6 +457,14 @@ static void ap_beacon(const char *tag)
 
 /* ---- public API ---- */
 
+/* [V846] Echo-gate state.  g_ap_in_use is raised while a playback
+ * session is open and dropped once its last transfer has been reaped;
+ * g_ap_stop_us records when that happened so the gate can hold for a
+ * short tail afterwards. */
+static volatile int      g_ap_in_use;
+static volatile uint64_t g_ap_stop_us;
+
+
 audio_playback_t *audio_playback_open(const char *dev_path,
     unsigned int sample_rate, unsigned int channels,
     unsigned int bits_per_sample)
@@ -323,20 +488,84 @@ audio_playback_t *audio_playback_open(const char *dev_path,
 
   /* Configure codec DAC + I2S0 TX for 16k/16bit/mono.  These ops also start
    * the TX channel, so playback begins as soon as we push PCM. */
-  es8311_dac_init();
-  ap_beacon("B7_AP_ESOK");
-
-  /* [V208] Read the codec back over I2C.  If the bus is dead, every write
-   * above was silently dropped and the DAC is mute no matter what the I2S
-   * side does -- so prove the bus first.  Reg 0x00 should read 0x80 and the
-   * DAC volume register 0x32 should read back the value we wrote. */
+  /* [V854] Program the codec, then PROVE it took.
+   *
+   * es8311_dac_init() is a long chain of read-modify-write steps and it
+   * also brings up the microphone path (0x44 reference ADCL+DACR, 0x14
+   * "analogue mic, not digital").  When the read behind one of those steps
+   * returns garbage the wrong value is written back, the ADC never starts,
+   * and the microphone reads silence -- while every I2S register still
+   * looks correct, which is why this went unnoticed for so long.
+   *
+   * Measured across builds: r00=0x80 with r32=0xbf means the mic works;
+   * r00=0x20 / 0x0a / 0xff means it reads 0 -- and i2c_errs is 0 either
+   * way, so the failure is invisible unless you verify.
+   *
+   * So verify, and re-run the whole sequence when it does not check out.
+   * Note the old message claimed "want 0xCB"; the sequence writes 0xBF,
+   * so 0xbf is the value that actually means success.
+   */
   {
-    uint8_t rb0 = es_readreg(ES_REG_RESET);
-    uint8_t rb32 = es_readreg(ES_REG_DAC_VOL);
+    uint8_t rb0  = 0;
+    uint8_t rb32 = 0;
+    int     attempt;
+
+    for (attempt = 0; attempt < 5; attempt++)
+      {
+        /* [V856] First boot (or a codec that will not verify) runs the
+         * real init with the snapshot recorder on.  Every later open
+         * replays it. */
+        if (g_es_snap_ok && attempt == 0)
+          {
+            es8311_replay_snapshot();
+          }
+        else
+          {
+            g_es_recording = 1;
+            es8311_dac_init();
+            g_es_recording = 0;
+          }
+
+        usleep(10000);
+
+        rb0  = es_readreg(ES_REG_RESET);
+        rb32 = es_readreg(ES_REG_DAC_VOL);
+
+        if (rb0 == 0x80 && rb32 == 0xBF)
+          {
+            if (!g_es_snap_ok && g_es_seen[ES_REG_RESET])
+              {
+                g_es_snap_ok = 1;
+                syslog(LOG_INFO,
+                       "[%s] [V856] codec snapshot captured: %d regs "
+                       "(r00=0x%02x r32=0x%02x)\n",
+                       TAG, g_es_snap_n, rb0, rb32);
+              }
+            break;
+          }
+
+        usleep(50000);
+      }
+
+    if (rb0 != 0x80 || rb32 != 0xBF)
+      {
+        syslog(LOG_ERR,
+               "[%s] [V854] codec did not verify after %d attempts "
+               "(r00=0x%02x r32=0x%02x) -- the mic path is probably dead\n",
+               TAG, attempt, rb0, rb32);
+      }
+    else if (attempt > 0)
+      {
+        syslog(LOG_WARNING,
+               "[%s] [V854] codec verified on attempt %d\n",
+               TAG, attempt + 1);
+      }
+
     syslog(LOG_INFO,
-           "[%s] codec readback: r00=0x%02x (want 0x80) r32=0x%02x (want 0x%02x) "
-           "i2c_errs=%d\n", TAG, rb0, rb32, 0xCB, g_i2c_errs);
+           "[%s] codec readback: r00=0x%02x (want 0x80) r32=0x%02x (want 0xbf) "
+           "i2c_errs=%d\n", TAG, rb0, rb32, g_i2c_errs);
   }
+  ap_beacon("B7_AP_ESOK");
 
   /* [V208] Every one of these returns a meaningful value: a 0 from
    * I2S_TXSAMPLERATE means i2s_check_mclkfrequency() rejected the rate, in
@@ -366,7 +595,320 @@ audio_playback_t *audio_playback_open(const char *dev_path,
          "[%s] direct playback opened (req rate=%u ch=%u bits=%u)\n",
          TAG, sample_rate, channels, bits_per_sample);
   ap_beacon("B7_AP_RET");
+  g_ap_in_use++;   /* [V846] speaker is live from here */
   return pb;
+}
+
+/* ── [V710] TX pipeline + turnaround instrumentation ────────────────────
+ *
+ * Until v709 audio_playback_write() ran ap_write_once() per chunk: submit,
+ * then block in sem_timedwait() until that transfer retired.  The driver
+ * keeps at most one buffer in priv->tx.act, so at the moment the DMA EOF
+ * ISR fires priv->tx.pend is empty, the transmitter stops, and the next
+ * buffer cannot be armed until alloc + memcpy + I2S_SEND have finished in
+ * the caller.  The TX FIFO holds ~64 samples (4 ms at 16 kHz); any longer
+ * turnaround is silence, and at one chunk per 64 ms that is a hole per
+ * syllable -- the reported stutter.
+ *
+ * Keeping a window of transfers in flight fixes it structurally: the next
+ * chunk is submitted *before* the oldest is retired, so the ISR always finds
+ * a descriptor waiting in tx.pend and the FIFO never runs dry.
+ *
+ * /tmp/pp.txt selects the window depth and is re-read every 64 calls:
+ *     absent / anything else -> g_pipe_depth (built-in default)
+ *     '0'                    -> off, i.e. the exact v709 path
+ *     '1'..'(AP_PIPE_MAX-1)' -> that many transfers in flight  [V870]
+ *
+ * The counters are reported once per playback session by
+ * audio_playback_close(); turn_avg / turn_max / slow are the audible holes.
+ */
+
+#define AP_PIPE_MAX 8        /* [V870] was 4: a 375 KB reply still
+                              * showed turn_max 230 ms at depth 4,
+                              * because the window was pinned at the
+                              * ceiling and could not absorb more. */
+
+struct ap_flight
+{
+  FAR struct ap_buffer_s *apb;
+  sem_t                   done;
+  int                     live;
+  int                     quarantined;   /* [V711] leaked: never free/re-use */
+};
+
+static struct ap_flight g_flight[AP_PIPE_MAX];
+static int              g_flight_q[AP_PIPE_MAX];   /* live slots, oldest first */
+static int              g_flight_qn;
+
+static int              g_pipe_depth = 8;   /* [V870] was 4: 8 x 127ms = 1 s in flight */
+static unsigned         g_pipe_tick;
+
+static uint32_t         g_ap_writes;
+static uint32_t         g_ap_chunks;
+static uint64_t         g_ap_bytes;
+static uint64_t         g_ap_busy_us;
+static uint64_t         g_ap_turn_us;
+static uint32_t         g_ap_turn_n;
+static uint32_t         g_ap_turn_max;
+static uint32_t         g_ap_slow;
+static uint64_t         g_ap_last_us;
+
+static uint64_t ap_now_us(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
+}
+
+static void ap_turn_note(uint64_t turn)
+{
+  g_ap_turn_us += turn;
+  g_ap_turn_n++;
+
+  if (turn > (uint64_t)g_ap_turn_max)
+    {
+      g_ap_turn_max = (uint32_t)(turn > 0xffffffffull ? 0xffffffffull : turn);
+    }
+
+  if (turn > 5000ull)
+    {
+      g_ap_slow++;
+    }
+}
+
+static void ap_pipe_refresh(void)
+{
+  FILE *f;
+  int   c;
+
+  if ((g_pipe_tick++ & 0x3fu) != 0u)
+    {
+      return;
+    }
+
+  f = fopen("/tmp/pp.txt", "r");
+
+  if (f != NULL)
+    {
+      c = fgetc(f);
+      fclose(f);
+
+      if (c >= '0' && c <= '0' + (AP_PIPE_MAX - 1))   /* [V870] */
+        {
+          g_pipe_depth = c - '0';
+        }
+    }
+}
+
+static void ap_pipe_drop(struct ap_flight *f)
+{
+  int idx = (int)(f - g_flight);
+  int i;
+
+  for (i = 0; i < g_flight_qn; i++)
+    {
+      if (g_flight_q[i] == idx)
+        {
+          int j;
+
+          for (j = i; j + 1 < g_flight_qn; j++)
+            {
+              g_flight_q[j] = g_flight_q[j + 1];
+            }
+
+          g_flight_qn--;
+          break;
+        }
+    }
+}
+
+static struct ap_flight *ap_pipe_free(void)
+{
+  int i;
+
+  for (i = 0; i < AP_PIPE_MAX; i++)
+    {
+      if (!g_flight[i].live)
+        {
+          return &g_flight[i];
+        }
+    }
+
+  return NULL;
+}
+
+static int ap_retire(struct ap_flight *f)
+{
+  struct timespec ts;
+  uint64_t        t0;
+  int             wrc;
+
+  if (f == NULL || !f->live)
+    {
+      return 0;
+    }
+
+  if (f->quarantined)
+    {
+      /* [V711] Already written off.  Waiting again would burn the whole
+       * budget for a transfer that is never going to be reported, so fail
+       * fast instead. */
+
+      return -ETIMEDOUT;
+    }
+
+  /* [V711] *** CLOCK_REALTIME, not CLOCK_MONOTONIC. ***
+   *
+   * sem_timedwait() is specified against CLOCK_REALTIME and this NuttX
+   * forwards it verbatim:
+   *
+   *     int sem_timedwait(FAR sem_t *sem, FAR const struct timespec *abstime)
+   *     {
+   *       return sem_clockwait(sem, CLOCK_REALTIME, abstime);
+   *     }
+   *
+   * v710 built the deadline from CLOCK_MONOTONIC, i.e. uptime.  CLOCK_REALTIME
+   * on this board is NTP-set to 2026 and the two clocks are ~1.79e9 s apart,
+   * so "uptime + 1.5 s" was already in the past and every single wait
+   * returned ETIMEDOUT immediately -- the log shows three "1.5 second"
+   * timeouts inside 62 ms (36.365, 36.365, 36.427).  The driver was then told
+   * that a live transfer had died, the apb was freed and the semaphore
+   * destroyed under a DMA that was still running, and the resulting
+   * container / bounce-slot imbalance killed the board inside
+   * i2s_buf_allocate().  ap_write_once() below has always used CLOCK_REALTIME;
+   * this now matches it exactly. */
+
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_sec  += 1;
+  ts.tv_nsec += 500000000;          /* +1.5 s, same budget as before */
+
+  if (ts.tv_nsec >= 1000000000)
+    {
+      ts.tv_sec  += 1;
+      ts.tv_nsec -= 1000000000;
+    }
+
+  t0  = ap_now_us();
+  wrc = sem_timedwait(&f->done, &ts);
+  g_ap_busy_us += ap_now_us() - t0;
+
+  if (wrc < 0)
+    {
+      uint32_t spent_ms = (uint32_t)((ap_now_us() - t0) / 1000ull);
+
+      if (g_tx_timeouts < 4)
+        {
+          g_tx_timeouts++;
+          syslog(LOG_ERR,
+                 "[%s] I2S TX completion TIMEOUT after %lums (n=%d) -- the "
+                 "TX DMA never drained; speaker cannot sound\n",
+                 TAG, (unsigned long)spent_ms, g_tx_timeouts);
+        }
+
+      /* [V711] *** Quarantine, do not free. ***
+       *
+       * A genuine timeout means the TX DMA still owns this transfer and its
+       * completion callback is still going to post &f->done.  Returning the
+       * apb to the heap now lets the very next apb_alloc() mint the same
+       * block (v710: "apb free ... refcount=1" followed immediately by
+       * "apb new apb=0x3c221628"), and sem_destroy() on a semaphore that is
+       * about to be posted corrupts the object the next flight re-inits in
+       * this slot.  Leak both instead: park the flight so ap_pipe_free()
+       * never hands it out again.  Losing a slot is recoverable; corrupting
+       * the heap is not. */
+
+      f->quarantined = 1;
+      g_ap_last_us   = ap_now_us();
+      return -ETIMEDOUT;
+    }
+
+  apb_free(f->apb);
+  sem_destroy(&f->done);
+  f->apb  = NULL;
+  f->live = 0;
+  g_ap_last_us = ap_now_us();
+  return 0;
+}
+
+static int ap_arm(struct ap_flight *f, const void *buf, size_t len)
+{
+  struct audio_buf_desc_s desc;
+  FAR struct ap_buffer_s *apb = NULL;
+  uint64_t                now;
+  int                     ret;
+
+  if (g_i2s == NULL)
+    {
+      return -ENODEV;
+    }
+
+  desc.numbytes  = len;
+  desc.u.pbuffer = &apb;
+
+  ret = apb_alloc(&desc);
+  if (ret < 0 || apb == NULL)
+    {
+      syslog(LOG_ERR, "[%s] apb_alloc(%u) failed: %d\n",
+             TAG, (unsigned)len, ret);
+      return ret < 0 ? ret : -ENOMEM;
+    }
+
+  /* [V711] Defensive: g_flight_q holds at most one entry per live slot, so
+   * this can never trip -- but an out-of-range store here would be silent
+   * corruption, so drop the transfer instead. */
+
+  if (g_flight_qn >= AP_PIPE_MAX)
+    {
+      apb_free(apb);
+      return -ENOMEM;
+    }
+
+  memcpy(apb->samp, buf, len);
+  apb->nbytes   = len;
+  apb->curbyte  = 0;
+  apb->nsamples = len / (ES_BITS / 8 * ES_CHANNELS);
+
+  sem_init(&f->done, 0, 0);
+  f->apb         = apb;
+  f->live        = 1;
+  f->quarantined = 0;
+
+  ret = I2S_SEND(g_i2s, apb, direct_tx_done, &f->done, MSEC2TICK(500));
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "[%s] i2s_send failed: %d\n", TAG, ret);
+      apb_free(apb);
+      sem_destroy(&f->done);
+      f->apb  = NULL;
+      f->live = 0;
+      return ret;
+    }
+
+  now = ap_now_us();
+
+  if (g_ap_last_us != 0ull)
+    {
+      ap_turn_note(now - g_ap_last_us);
+    }
+
+  g_flight_q[g_flight_qn++] = (int)(f - g_flight);
+  g_ap_chunks++;
+  g_ap_bytes += (uint64_t)len;
+  return (int)len;
+}
+
+static void ap_drain_all(void)
+{
+  while (g_flight_qn > 0)
+    {
+      struct ap_flight *f = &g_flight[g_flight_q[0]];
+
+      ap_retire(f);
+      ap_pipe_drop(f);
+    }
+
+  g_ap_last_us = 0ull;
 }
 
 /* [V212] Upper bound for a single transfer.
@@ -408,7 +950,6 @@ static int ap_write_once(audio_playback_t *pb, const void *buf, size_t len)
       return 0;
     }
 
-
   desc.numbytes  = len;
   desc.u.pbuffer = &apb;
   ret = apb_alloc(&desc);
@@ -420,9 +961,9 @@ static int ap_write_once(audio_playback_t *pb, const void *buf, size_t len)
     }
 
   memcpy(apb->samp, buf, len);
-  apb->nbytes    = len;
-  apb->curbyte   = 0;
-  apb->nsamples  = len / (ES_BITS / 8 * ES_CHANNELS);
+  apb->nbytes   = len;
+  apb->curbyte  = 0;
+  apb->nsamples = len / (ES_BITS / 8 * ES_CHANNELS);
 
   sem_init(&done, 0, 0);
 
@@ -439,6 +980,21 @@ static int ap_write_once(audio_playback_t *pb, const void *buf, size_t len)
       sem_destroy(&done);
       return ret;
     }
+
+  /* [V671] *** Nothing happens between the queue and the wait any more. ***
+   *
+   * v663..v668 ran their rate probes right here: esp32s3_i2s_v663_lrck()
+   * busy-waited 50 ms on two transfers while re-enabling the IO_MUX input
+   * buffers of the very pads the I2S was driving, esp32s3_i2s_v666_force_mono()
+   * rewrote three TX registers plus a TX_UPDATE on every transfer, and each
+   * transfer printed one or two syslog records.  All of that landed in the gap
+   * between two DMA transfers, where the TX FIFO holds only about 64 samples
+   * (4 ms at 16 kHz), so every probe became an audible dropout.
+   *
+   * The probes have served their purpose (the V669 TDM fix, the V670 clock
+   * fix and the V671 light re-arm are all documented in esp32s3_i2s.c), and
+   * the write path is silent again.  The one remaining report is a single
+   * line per utterance from audio_playback_close(). */
 
   {
     struct timespec ts;
@@ -482,8 +1038,21 @@ static int ap_write_once(audio_playback_t *pb, const void *buf, size_t len)
  * if a later chunk fails. */
 int audio_playback_write(audio_playback_t *pb, const void *buf, size_t len)
 {
+  /* [V811d] Drive the alternating mute from the playback path itself, so the
+   * switch only ever runs while audio is actually flowing -- which is when the
+   * comparison is valid. */
+  {
+    static unsigned long v811d_ticks;
+
+    if ((v811d_ticks++ % 96u) == 0u)
+      {
+        v811_mute_alternate();
+      }
+  }
+
   const unsigned char *p = (const unsigned char *)buf;
   size_t done = 0;
+  int    depth;
 
   if (pb == NULL)
     {
@@ -495,17 +1064,107 @@ int audio_playback_write(audio_playback_t *pb, const void *buf, size_t len)
       return 0;
     }
 
+  ap_pipe_refresh();
+  depth = g_pipe_depth;
+
+  if (depth > AP_PIPE_MAX)
+    {
+      depth = AP_PIPE_MAX;
+    }
+
+  g_ap_writes++;
+
+  if (pb->stopped && g_flight_qn > 0)
+    {
+      ap_drain_all();
+    }
+
+  if (depth <= 0)
+    {
+      /* [V710] v709 behaviour, kept verbatim as the A/B baseline.  The
+       * counters are still maintained so the two paths can be compared. */
+
+      while (done < len)
+        {
+          size_t   n = len - done;
+          uint64_t t0;
+          int      ret;
+
+          if (n > AP_WRITE_CHUNK_MAX)
+            {
+              n = AP_WRITE_CHUNK_MAX;
+            }
+
+          t0 = ap_now_us();
+
+          if (g_ap_last_us != 0ull)
+            {
+              ap_turn_note(t0 - g_ap_last_us);
+            }
+
+          ret = ap_write_once(pb, p + done, n);
+          g_ap_bytes += (uint64_t)n;
+          g_ap_chunks++;
+
+          if (ret < 0)
+            {
+              g_ap_last_us = ap_now_us();
+              g_ap_busy_us += g_ap_last_us - t0;
+              return done > 0 ? (int)done : ret;
+            }
+
+          g_ap_last_us = ap_now_us();
+          g_ap_busy_us += g_ap_last_us - t0;
+          done += n;
+        }
+
+      return (int)done;
+    }
+
   while (done < len)
     {
-      size_t n = len - done;
-      int ret;
+      struct ap_flight *f;
+      size_t            n = len - done;
+      int               ret;
 
       if (n > AP_WRITE_CHUNK_MAX)
         {
           n = AP_WRITE_CHUNK_MAX;
         }
 
-      ret = ap_write_once(pb, p + done, n);
+      if (pb->stopped)
+        {
+          return done > 0 ? (int)done : -ECANCELED;
+        }
+
+      /* Retire only when the window is full or no slot is free.  That is the
+       * whole fix: at the moment the oldest transfer retires, the buffers
+       * submitted after it are already sitting in the driver's tx.pend, so
+       * the EOF ISR has something to promote and the FIFO never runs dry. */
+
+      f = ap_pipe_free();
+
+      if (f == NULL || g_flight_qn >= depth)
+        {
+          f = &g_flight[g_flight_q[0]];
+
+          ret = ap_retire(f);
+          ap_pipe_drop(f);
+
+          if (ret < 0)
+            {
+              return done > 0 ? (int)done : ret;
+            }
+
+          f = ap_pipe_free();
+        }
+
+      if (f == NULL)
+        {
+          return done > 0 ? (int)done : -ENOMEM;
+        }
+
+      ret = ap_arm(f, p + done, n);
       if (ret < 0)
         {
           return done > 0 ? (int)done : ret;
@@ -570,11 +1229,125 @@ void audio_playback_stop(audio_playback_t *pb)
       return;
     }
 
+  /* [V710] Only latch the flag.  Draining here would block the PTT/abort
+   * caller for up to one transfer per in-flight slot; the speak thread owns
+   * the queue and reaps it on its next write, and audio_playback_close()
+   * drains unconditionally. */
+
   pb->stopped = true;
 }
 
+/* [V846] Is the speaker audible right now?
+ *
+ * Two terms: an open playback session, plus a 400 ms tail after it
+ * closes.  The tail matters -- ap_drain_all() has retired the DMA
+ * transfer but the sound has not left the room, and the log shows the
+ * VAD re-opening on the decay of the device's own reply. */
+int audio_playback_echo_active(void)
+{
+  if (g_ap_in_use > 0)
+    {
+      return 1;
+    }
+
+  if (g_ap_stop_us != 0ull &&
+      (ap_now_us() - g_ap_stop_us) < 400000ull)
+    {
+      return 1;
+    }
+
+  return 0;
+}
+
+
 void audio_playback_close(audio_playback_t *pb)
 {
+  /* [V671] One line per playback session: how many transfers took the light
+   * re-arm path and how many had to reconfigure the transmitter. */
+
+  /* [V710] Reap whatever is still in flight and report the turnaround
+   * statistics for this session.  count / busy come straight from the audio
+   * layer; turn_avg and turn_max are the gaps between a transfer retiring
+   * and the next one being submitted, i.e. the audible holes. */
+
+  ap_drain_all();
+
+  /* [V858] *** Hand the port back to the microphone. ***
+   *
+   * This function used to stop at ap_drain_all() and never touch the
+   * I2S port, so everything i2s_txdma_start() had latched for the
+   * speaker -- MONO / CHAN_EQUAL / LEFT_ALIGN cleared, the playback
+   * TDM frame, and, after an "I2S TX completion TIMEOUT", a
+   * quarantined container whose DMA descriptor is still linked -- was
+   * what the next capture inherited.  That capture then produced all
+   * zeros or a frozen DC for the rest of the boot.
+   *
+   * Release whatever the playback abandoned, then re-lock.  Skipped
+   * internally while a capture is streaming; a playback and a capture
+   * never run at the same time on this board anyway. */
+
+  esp32s3_i2s_v858_after_playback();
+
+  /* [V846] The DMA queue is drained, so the speaker stops here. */
+  g_ap_in_use--;
+
+  if (g_ap_in_use < 0)
+    {
+      g_ap_in_use = 0;
+    }
+
+  g_ap_stop_us = ap_now_us();
+
+  {
+    uint32_t w     = g_ap_writes;
+    uint32_t c     = g_ap_chunks;
+    uint64_t bytes = g_ap_bytes;
+    uint64_t busy  = g_ap_busy_us;
+    uint64_t turn  = g_ap_turn_us;
+    uint32_t tn    = g_ap_turn_n;
+    uint32_t tmax  = g_ap_turn_max;
+    uint32_t slow  = g_ap_slow;
+
+    g_ap_writes  = 0u;
+    g_ap_chunks  = 0u;
+    g_ap_bytes   = 0ull;
+    g_ap_busy_us = 0ull;
+    g_ap_turn_us = 0ull;
+    g_ap_turn_n  = 0u;
+    g_ap_turn_max = 0u;
+    g_ap_slow    = 0u;
+    g_ap_last_us = 0ull;
+
+    syslog(LOG_INFO,
+           "[%s] [V710] pb: writes=%lu chunks=%lu pcm=%lu busy=%lums "
+           "turn_avg=%lums turn_max=%lums slow=%lu pipe=%d\n",
+           TAG, (unsigned long)w, (unsigned long)c,
+           (unsigned long)(bytes / 1024ull),
+           (unsigned long)(busy / 1000ull),
+           (unsigned long)(tn ? (turn / (uint64_t)tn) / 1000ull : 0ull),
+           (unsigned long)(tmax / 1000u),
+           (unsigned long)slow, g_pipe_depth);
+  }
+
+  {
+    static uint32_t s_full;
+    static uint32_t s_light;
+    uint32_t full  = 0u;
+    uint32_t light = 0u;
+
+    esp32s3_i2s_v671_stats(&full, &light);
+
+    syslog(LOG_ERR,
+           "[%s] [V671] tx re-arm this session: full=%lu light=%lu "
+           "(cumulative full=%lu light=%lu)\n",
+           TAG,
+           (unsigned long)(full - s_full), (unsigned long)(light - s_light),
+           (unsigned long)full, (unsigned long)light);
+
+    s_full  = full;
+    s_light = light;
+  }
+
   if (pb)
     {
       free(pb);

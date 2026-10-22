@@ -11,6 +11,10 @@
 与闭源商用音箱的区别：代码全部开放、可二次开发、不绑定厂商云生态，
 并且针对**校园网（存在策略路由与专网出口）**做了公网 / 内网双后端降级。
 
+**决赛阶段新增**：接入双轴舵机云台与 K230 视觉协处理器，实现**人脸跟踪** ——
+K230 在本地跑人脸检测，通过 UDP 把人脸中心坐标（千分比）实时发给 ESP32，
+ESP32 用 LEDC PWM 驱动两个舵机，让人脸始终保持在画面中央。
+
 主要工作量在系统侧适配与修复：
 
 - 修复 ESP32-S3 **I2S 单端口全双工**时钟配置（TX 占用端口时 RX 被强制设为从模式，
@@ -40,12 +44,17 @@ ai_vox3/
 │   ├── my_ai_tool/          示例自定义工具
 │   └── hello_app/           示例应用
 ├── packages_ai_agent/       ai_agent 框架（语音 / 网络 / 工具 / Skill 运行时）
+│   └── src/companion_face.c                 人脸跟踪控制律（决赛新增）
+│   └── src/servo.c                           LEDC 舵机驱动（决赛新增）
+├── apps/                    openvela apps 侧改动（netinit / wapi）
 └── nuttx/                   内核与板级改动
-    ├── arch/xtensa/src/esp32s3/              I2S、GDMA 驱动修复
+    ├── arch/xtensa/src/esp32s3/              I2S、GDMA 驱动修复、LEDC 舵机 PWM
     ├── boards/xtensa/esp32s3/esp32s3-eye/    板级配置与 bringup
     └── drivers/audio/es8311.c                编解码器
-docs/                        技术文档（含 V399–V401 RX 崩溃排查复盘）
-logs/                        AI Coding 日志
+docs/                        技术文档（含 V399–V401 RX 崩溃排查复盘、
+                             双轴云台与 K230 人脸跟踪）
+firmware/v1044.bin           预编译固件（可直接烧录验证，含云台与人脸跟踪）
+logs/                        AI Coding 对话日志（按 GitHub 账号归集）
 ```
 
 ## 四、运行方式
@@ -78,6 +87,15 @@ python -m esptool --chip esp32s3 --port <COM> write_flash 0x0 nuttx.bin
 
 烧完**松开 BOOT 并拔插 USB**（否则芯片会停在 ROM 下载模式，串口 0 字节）。
 
+想跳过编译直接验证，可用仓库内预编译固件 `firmware/v1044.bin`（已含双轴云台与 K230 人脸跟踪）：
+
+```bash
+python -m esptool --chip esp32s3 --port <COM> -b 460800 \
+  --before default_reset --after hard_reset write_flash 0x0 firmware/v1044.bin
+```
+
+> 只写 `0x0`。**不要动 `0x9000`**（NVS 分区，存有 WiFi 凭据等）。
+
 ### 4. 运行
 
 - 上电约 35 s 后自播开机问候语「桌面小跟班语音就绪」。
@@ -97,6 +115,16 @@ python -m esptool --chip esp32s3 --port <COM> write_flash 0x0 nuttx.bin
 | LCD MOSI / CLK / DC / CS / BCKL | 21 / 17 / 14 / 15 / 16 |
 | BOOT（PTT） | GPIO0 |
 | VOL+ / VOL− | 46 / 45 |
+| **舵机 PAN（水平）** | **GPIO2（LEDC CH0）** |
+| **舵机 TILT（俯仰）** | **GPIO1（LEDC CH1）** |
+
+> 舵机引脚曾被引脚配置宏 `[SERVO-R39]` 错误地设成 GPIO4，而 GPIO4 在本板是台灯继电器；
+> 已修正为 PAN=GPIO2 / TILT=GPIO1。
+
+**K230 侧**：独立供电，连 WiFi SSID `3124`，自身地址 `192.168.110.12`，
+向 ESP32 的 `192.168.110.154:3333` 发送 UDP 报文 `F,<cx>,<cy>,<w>,<h>,<conf>\n`
+（cx/cy/w/h 为千分比 0..1000，conf 为 0..100 置信度），无人脸时发 `N\n`。
+K230 的 USB 是复合设备，其中 `MI_02` 为 MTP，可在「此电脑」直接访问其 SD 卡。
 
 ### 6. 服务端端点
 
@@ -130,7 +158,9 @@ python -m esptool --chip esp32s3 --port <COM> write_flash 0x0 nuttx.bin
 3. 外部包 Kconfig 符号（`CONFIG_AI_AGENT_VOICE_BOOT_TEST`）会被 nuttx `olddefconfig`
    静默丢弃，`#ifdef` 包住的代码从未编译 → 此后一律改为显式宏门控并在 ELF 中校验符号。
 
-完整对话日志见 `logs/` 目录。
+完整对话日志已归集到 `logs/uhh27/`（按官方结构：
+`<date>/claude-code__<sid>.jsonl` + `manifest.json`），
+合计 **6464 条真实对话事件**，覆盖 2026-10-14 至 2026-10-22 共 9 个开发日。
 
 ## 六、已知不足与后续
 
@@ -139,3 +169,9 @@ python -m esptool --chip esp32s3 --port <COM> write_flash 0x0 nuttx.bin
    并尝试在 RX 中断期间临界区屏蔽 WiFi FIQ 验证假设。
 2. 唤醒词尚未接入，当前为按键 PTT。
 3. 未做系统级低功耗优化。
+4. 云台为**开环绝对映射**（摄像头固定在桌面，不随云台运动），人脸快速大范围移动时
+   依赖 K230 的检测帧率；后续可考虑把摄像头装上云台改为闭环，但需重新推导稳定性。
+5. K230 的 bootloader 会优先从远端 HTTP 拉取脚本并覆盖 SD 卡缓存，
+   因此直接改 SD 卡上的脚本未必生效，量产时应固化到本地。
+6. DRAM 余量仅约 112 字节（`dram0_0_seg` 止于 `0x3FCD0000`），
+   新增静态数组极易触发链接器 `region dram0_0_seg overflowed`。
