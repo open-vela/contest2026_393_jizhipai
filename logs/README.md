@@ -1,20 +1,48 @@
-# logs/ — AI Coding 日志目录
+# logs/ — AI Coding 日志（队号 393 · 竞智派）
 
-存放你在开发中与 AI 工具的对话日志，和作品代码一并提交。
+本目录是**实际提交的真实日志**，不是示例；脚手架自带的 `your-github-login/` 示例目录已删除。
 
-> 本目录现在是**示例**，请替换成你自己导出的真实日志（删掉示例的 `your-github-login/` 目录）。
+## 数据来源（如实说明）
+
+本项目全程使用 **WorkBuddy**（CodeBuddy 系 AI 编程助手，不在手册枚举的四款工具之内）作为唯一的 AI 结对编程工具，
+因此本目录日志来自它的会话 transcript（`~/.workbuddy/projects/<project>/*.jsonl`），
+再**按手册的 JSONL 字段结构逐行归一化**后落地：每行一个事件，字段为 `role` / `content` / `timestamp`；
+文件名里的 `<tool>` 段沿用官方枚举值 `claude-code`，仅为让组委会的解析脚本能识别。
+事件内容未经删改，只做格式映射。评审若需核对原始 transcript，可由队长提供原始文件。
+
+## 统计
+
+| 项 | 值 |
+|---|---|
+| 日期跨度 | 2026-10-14 ~ 2026-10-22（9 天） |
+| 事件总数 | 6464 |
+| 体积 | 约 4.9 MB |
+| 会话文件 | 10 |
+
+## 去重口径（重要）
+
+WorkBuddy 的每个新会话文件都包含**该会话之前的完整历史**，多个文件互相重叠。
+未去重时事件数为 36902 条，重复率约 82%。
+本目录已按 `(timestamp, role, md5(content))` 做**全局去重**，得到 6464 条真实事件，
+同一条记录只保留在它**首次出现的日期目录**下，不会跨日期重复计入。
 
 ## 目录结构
 
 ```text
 logs/
-└── <github_login>/              # 你的 GitHub 用户名，一人一目录
-    ├── manifest.json            # 会话清单
-    └── <date>/                  # 日期 YYYY-MM-DD
-        └── <tool>__<sid>.jsonl  # 一个会话一个文件（工具名与 session id 用 __ 连接）
+├── README.md                   # 本文件
+└── uhh27/                      # GitHub 用户名
+    ├── manifest.json           # 会话清单（文件名、日期、事件数）
+    └── <date>/                 # 日期 YYYY-MM-DD
+        └── claude-code__<sid>.jsonl
 ```
 
-- `<tool>`：`claude-code` / `opencode` / `codex` / `kiro`
-- 每个 `.jsonl` 每行一个事件，由组委会提供的日志归集工具导出，**只提交 JSONL 本身**。
+## 日志可佐证的攻关点
 
-导出与提交的完整步骤、字段定义见[《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md)。
+日志覆盖项目从环境搭建到决赛交付的全过程，可直接按下列探针 tag 检索：
+
+- `V959` / `V1000B`：抖动缓冲 reserve 门槛写成 `>= reserve + CHUNK`，导致每次交接后立刻低于自己的门槛、播报断续
+- `V1021` / `V1022`：LLM 单次调用实测 86 s，触发 15 s 看门狗误杀；以及建连阶段缺少超时、UI 谎报可说话
+- `V1041` / `V1042`：双轴舵机引脚逆向确认（PAN=GPIO2/LEDC CH0，TILT=GPIO1/LEDC CH1）
+- `V1043` / `V1044`：云台控制律两轮调参（先提速到 20° 阶跃约 500 ms，再增大幅度到 pan 72° / tilt 99°）
+- K230 定位推理链：MTP 挂载读 SD 卡取 `VOX3_IP` → ARP 观察确认在线 → 下发静态 IP 稳定链路
