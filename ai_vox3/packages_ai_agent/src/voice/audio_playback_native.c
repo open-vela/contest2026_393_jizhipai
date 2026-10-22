@@ -34,21 +34,109 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mqueue.h>
+#include <pthread.h>
 #include <nuttx/audio/audio.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <stdint.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
+/* [V1024] Probe gate.
+ *
+ * This build carries ~60 probe lines/s during a reply, and a few
+ * of them ([V810], [V1012]) dump raw PCM straight at the console.
+ * Console throughput here is ~4300 chars/s with an 8 KB ring, so a
+ * printf blocks hard once it fills.  At 60 lines/s the audio thread
+ * spends most of its budget inside printf, which is itself a source
+ * of the stutter we are trying to measure.
+ *
+ * g_v1024_quiet == 1 suppresses every [Vnnn] printf except the
+ * handful of load-bearing ones (see KEEP in the patch script).
+ * Flip it to 0 at runtime from NSH to bring them all back.
+ */
+#ifdef __cplusplus
+extern "C" int g_v1024_quiet;
+#else
+extern int g_v1024_quiet;
+#endif
+
+#ifndef V1024_QUIET
+#define V1024_QUIET 1
+#endif
+#define V1024P(...) do { if (V1024_QUIET == 0) printf(__VA_ARGS__); } while (0)
+#define V1024S(lvl, ...) do { if (V1024_QUIET == 0) syslog(lvl, __VA_ARGS__); } while (0)
+
+
 static const char* TAG = "audio_pb_nat";
+
+/* [V924] DIAGNOSTIC ONLY -- playback-session census.
+ *
+ * /dev/audio/pcm0p is opened by more than one place, and the log shows
+ * '[R36] configure OUT' + 'native playback ready' landing in the middle
+ * of a stream that is already playing.  Each of those re-programs the
+ * ES8311 and the I2S TX channel, and each matching close() issues
+ * AUDIOIOC_STOP.  Both punch a hole into whatever is playing.
+ *
+ * Before changing any of that, count the sessions: this block tags every
+ * open/close/write with a session id, the caller return address (resolve
+ * with addr2line) and the number of sessions currently live.  Nothing
+ * here gates or skips anything, so the audio path is bit-for-bit the one
+ * V923 shipped. */
+
+static pthread_mutex_t g_v924_lock = PTHREAD_MUTEX_INITIALIZER;
+static int             g_v924_live;
+static unsigned int    g_v924_seq;
+
+static int v924_live(void)
+{
+    int n;
+
+    pthread_mutex_lock(&g_v924_lock);
+    n = g_v924_live;
+    pthread_mutex_unlock(&g_v924_lock);
+    return n;
+}
+
+/* [V925] DIAGNOSTIC ONLY -- transmitter census and feed-hole detector.
+ *
+ * deq  = every AUDIO_MSG_DEQUEUE the driver hands back.  One apb here is
+ *        4096 B = 1024 stereo frames at 16 bit, so deq/s * 1024 is the
+ *        frame rate the I2S transmitter is really running at.  If that
+ *        number is not ~16000 the DAC clock is wrong, not the software.
+ * gap  = distance between two consecutive write() calls.  A 20 ms packet
+ *        cadence is normal; anything past 60 ms means a buffer ran dry
+ *        and the speaker had nothing to shift out. */
+
+static uint64_t g_v925_t0_us;
+static uint64_t g_v925_last_us;
+static unsigned g_v925_deq;
+static unsigned g_v925_snap;
 
 /* Pipeline geometry when the driver does not report its own
  * (GETBUFFERINFO fails on the es8311 lower half in this build).
  * 4096 B @ 24 kHz mono s16le = ~85 ms per buffer, 4 buffers deep. */
 
-#define PB_FALLBACK_NBUFFERS  4
+/* [V1007] 4 -> 8 buffers.
+ *
+ * THIS is the pool that actually plays.  Everything patched in
+ * ai_vox/.../audio_output_engine.cpp sits upstream of it (jitter buffer,
+ * pacing), and the nbuffers=8 raised in nuttx/audio/audio.c (v1001) only
+ * feeds upper-half bookkeeping -- this driver keeps its own geometry and
+ * kept reporting "4 x 4096 B".
+ *
+ * 4 x 4096 B = 16 KB = 512 ms at 16 kHz/16-bit/mono, in 128 ms buffers.
+ * Measured arrival holes reach 220 ms and the downlink runs slightly
+ * ABOVE realtime ([V1002] fill 104-110%), so bursts overflow a pool this
+ * shallow and the transmitter runs dry.
+ *
+ * 8 x 4096 B = 32 KB = 1.0 s.  PB_MAX_NBUFFERS is already 8, so this is
+ * the sanctioned ceiling; the 4096 B size stays well inside the DMA
+ * ceiling of 4095 * 2 = 8190 B. */
+#define PB_FALLBACK_NBUFFERS  8
 #define PB_FALLBACK_BUFSIZE   4096
 
 #define PB_MAX_NBUFFERS       8
@@ -77,6 +165,12 @@ struct native_pb_s {
     volatile int stopped;
     int complete;                 /* driver sent AUDIO_MSG_COMPLETE */
     size_t total_written;
+
+    /* [V924] census, diagnostics only */
+    unsigned int v924_id;
+    unsigned int v924_writes;
+    unsigned int v924_deq;
+    int          v924_counted;
 };
 
 /* Return the next free apb, reclaiming played-out buffers from the mq.
@@ -105,6 +199,48 @@ static struct ap_buffer_s* pb_take_free(struct native_pb_s* pb)
 
         switch (msg.msg_id) {
         case AUDIO_MSG_DEQUEUE:
+            g_v925_deq++;            /* [V925] transmitter census */
+
+            /* [V969] *** How long does one buffer take to play out? ***
+             *
+             * See the header comment: this interval is the one quantity on
+             * the playback path that does not depend on whether we or the
+             * downlink is the bottleneck.  Reported as a running average so
+             * the 10 ms clock tick averages out and so a replayed log
+             * segment cannot pass for a second measurement. */
+            {
+              struct timespec v969_ts;
+              int64_t         v969_now;
+              static int64_t  s_v969_last = -1;
+              static uint64_t s_v969_sum  = 0;
+              static uint32_t s_v969_n    = 0;
+
+              clock_gettime(CLOCK_MONOTONIC, &v969_ts);
+              v969_now = (int64_t)v969_ts.tv_sec * 1000000LL
+                + (int64_t)v969_ts.tv_nsec / 1000LL;
+
+              if (s_v969_last >= 0 && v969_now > s_v969_last) {
+                s_v969_sum += (uint64_t)(v969_now - s_v969_last);
+              }
+
+              s_v969_last = v969_now;
+              ++s_v969_n;
+
+              if ((s_v969_n % 8U) == 0U) {
+                uint32_t v969_avg = (uint32_t)(s_v969_sum / s_v969_n);
+                unsigned v969_sz  = (unsigned)(pb->apbs && pb->apbs[0]
+                                               ? pb->apbs[0]->nmaxbytes : 0u);
+
+                V1024P("[V969]] DEQ n=%u int_us=%u bufsz=%u "
+                       "hz4=%u\n",
+                       s_v969_n, v969_avg, v969_sz,
+                       v969_avg
+                         ? (unsigned)((uint64_t)v969_sz * 1000000ULL
+                                      / (4ULL * (uint64_t)v969_avg))
+                         : 0u);
+              }
+            }
+
             if (msg.u.ptr && pb->outstanding > 0) {
                 pb->outstanding--;
                 pb->freeq[pb->nfree++] = (struct ap_buffer_s*)msg.u.ptr;
@@ -168,6 +304,10 @@ int native_playback_open(native_pb_t** out_pb, const char* dev_path,
     }
 
     *out_pb = NULL;
+
+    V1024S(LOG_ERR, "[V924]] OPEN ra=%p live=%d fmt=%u/%u/%u\n",
+        __builtin_return_address(0), v924_live(), sample_rate, channels,
+        bits_per_sample);
 
     pb = calloc(1, sizeof(*pb));
     if (!pb) {
@@ -269,6 +409,19 @@ int native_playback_open(native_pb_t** out_pb, const char* dev_path,
         goto err_out;
     }
 
+    {
+        int v924_n;
+
+        pthread_mutex_lock(&g_v924_lock);
+        pb->v924_id = ++g_v924_seq;
+        pb->v924_counted = 1;
+        v924_n = ++g_v924_live;
+        pthread_mutex_unlock(&g_v924_lock);
+
+        V1024S(LOG_ERR, "[V924]] OPENED id=%u live=%d\n", pb->v924_id,
+            v924_n);
+    }
+
     *out_pb = pb;
     syslog(LOG_INFO,
         "[%s] native playback ready (%s, %uHz %uch %ubit, %d x %u B)\n",
@@ -293,6 +446,36 @@ int native_playback_write(native_pb_t* pb, const void* buf, size_t len)
 
     if (pb->stopped) {
         return -ECANCELED;
+    }
+
+    {
+        struct timespec v925_ts;
+        uint64_t v925_us;
+
+        clock_gettime(CLOCK_MONOTONIC, &v925_ts);
+        v925_us = (uint64_t)v925_ts.tv_sec * 1000000ULL
+            + (uint64_t)v925_ts.tv_nsec / 1000ULL;
+
+        if (g_v925_last_us != 0 && v925_us > g_v925_last_us
+            && (v925_us - g_v925_last_us) > 60000ULL) {
+            V1024S(LOG_ERR, "[V925]] GAP %u ms id=%u out=%d\n",
+                (unsigned)((v925_us - g_v925_last_us) / 1000ULL),
+                pb->v924_id, pb->outstanding);
+        }
+
+        g_v925_last_us = v925_us;
+
+        if (g_v925_t0_us == 0) {
+            g_v925_t0_us = v925_us;
+        } else if ((v925_us - g_v925_t0_us) >= 1000000ULL) {
+            unsigned v925_n = g_v925_deq - g_v925_snap;
+
+            V1024S(LOG_ERR, "[V925]] tx deq/s=%u est=%u Hz out=%d\n",
+                v925_n, v925_n * 1024u, pb->outstanding);
+
+            g_v925_snap = g_v925_deq;
+            g_v925_t0_us = v925_us;
+        }
     }
 
     while (remaining > 0) {
@@ -328,6 +511,15 @@ int native_playback_write(native_pb_t* pb, const void* buf, size_t len)
         src += n;
         remaining -= n;
         pb->total_written += n;
+
+        /* [V924] every 32nd write: which session is feeding, how full
+         * the pipeline is, and how much of the current apb is used. */
+        if ((++pb->v924_writes % 32U) == 0U) {
+            V1024S(LOG_ERR, "[V924]] W id=%u k=%u tot=%u out=%d cur=%d live=%d\n",
+                pb->v924_id, pb->v924_writes,
+                (unsigned)pb->total_written, pb->outstanding,
+                pb->cur ? (int)pb->cur->nbytes : -1, v924_live());
+        }
 
         if (apb->nbytes >= apb->nmaxbytes) {
             int ret = pb_flush_cur(pb);
@@ -368,6 +560,10 @@ void native_playback_close(struct native_pb_s* pb)
         return;
     }
 
+    V1024S(LOG_ERR, "[V924]] CLOSE id=%u out=%d tot=%u live=%d stopped=%d\n",
+        pb->v924_id, pb->outstanding, (unsigned)pb->total_written,
+        v924_live(), pb->stopped);
+
     if (!pb->stopped && pb->fd >= 0) {
         /* Graceful drain: flush the partial buffer, then wait until the
          * driver returned every enqueued buffer so nothing is cut off. */
@@ -384,6 +580,7 @@ void native_playback_close(struct native_pb_s* pb)
 
                 if (msg.msg_id == AUDIO_MSG_DEQUEUE && msg.u.ptr &&
                     pb->outstanding > 0) {
+                    pb->v924_deq++;
                     pb->outstanding--;
                     pb->freeq[pb->nfree++] =
                         (struct ap_buffer_s*)msg.u.ptr;
@@ -421,6 +618,23 @@ void native_playback_close(struct native_pb_s* pb)
 
     free(pb->apbs);
     free(pb->freeq);
+
+    {
+        int v924_n = 0;
+
+        if (pb->v924_counted) {
+            pthread_mutex_lock(&g_v924_lock);
+            if (g_v924_live > 0) {
+                g_v924_live--;
+            }
+            v924_n = g_v924_live;
+            pthread_mutex_unlock(&g_v924_lock);
+        }
+
+        V1024S(LOG_ERR, "[V924]] CLOSED id=%u deq=%u live=%d\n",
+            pb->v924_id, pb->v924_deq, v924_n);
+    }
+
     free(pb);
 
     syslog(LOG_INFO, "[%s] closed\n", TAG);

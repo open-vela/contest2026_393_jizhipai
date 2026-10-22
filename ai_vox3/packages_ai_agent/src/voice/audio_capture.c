@@ -50,6 +50,20 @@
 #include <syslog.h>
 #include <unistd.h>
 
+/* [V1024] Probe gate -- see fortify_stubs.c. */
+#ifdef __cplusplus
+extern "C" int g_v1024_quiet;
+#else
+extern int g_v1024_quiet;
+#endif
+
+#ifndef V1024_QUIET
+#define V1024_QUIET 1
+#endif
+#define V1024P(...) do { if (V1024_QUIET == 0) printf(__VA_ARGS__); } while (0)
+#define V1024S(lvl, ...) do { if (V1024_QUIET == 0) syslog(lvl, __VA_ARGS__); } while (0)
+
+
 static const char* TAG = "audio_cap";
 
 #define CAP_OPTIONS_LEN 128
@@ -62,6 +76,11 @@ static const char* TAG = "audio_cap";
 #else
 #define AGENT_AUDIO_CAPTURE_GAIN 6
 #endif
+
+/* [V845] Highest absolute sample value the capture path is allowed to emit.
+ * 31500 leaves ~4% headroom under the int16 rail so the clamp below never
+ * actually fires. */
+#define V845_CEILING 31500
 
 enum audio_capture_backend {
     AUDIO_CAPTURE_BACKEND_NONE = 0,
@@ -118,15 +137,63 @@ static void apply_capture_gain(void* buf, size_t len)
 #if AGENT_AUDIO_CAPTURE_GAIN > 1
     int16_t* samples = (int16_t*)buf;
     int count = (int)len / (int)sizeof(int16_t);
+    int i;
+    int32_t peak = 0;
+    int32_t g = AGENT_AUDIO_CAPTURE_GAIN;
+    int32_t safe;
 
-    for (int i = 0; i < count; i++) {
-        int32_t v = (int32_t)samples[i] * AGENT_AUDIO_CAPTURE_GAIN;
+    /* [V845] Measure the chunk before amplifying it.
+     *
+     * The old version multiplied by AGENT_AUDIO_CAPTURE_GAIN (6) unconditionally
+     * and clamped the overflow, which turned the top of every syllable into a
+     * square wave -- see peak=32768 min=-32768 on chunk#1/#50/#100/#150 of any
+     * capture log from this board.  A recogniser fed that answers nothing. */
+
+    for (i = 0; i < count; i++) {
+        int32_t a = (int32_t)samples[i];
+
+        if (a < 0) {
+            a = -a;
+        }
+
+        if (a > peak) {
+            peak = a;
+        }
+    }
+
+    /* Largest multiplier that still fits this chunk under the ceiling. */
+    safe = (peak > 0) ? (V845_CEILING / peak) : AGENT_AUDIO_CAPTURE_GAIN;
+    if (safe < 1) {
+        safe = 1;
+    }
+
+    if (g > safe) {
+        g = safe;
+    }
+
+    for (i = 0; i < count; i++) {
+        int32_t v = (int32_t)samples[i] * g;
+
         if (v > 32767) {
             v = 32767;
         } else if (v < -32768) {
             v = -32768;
         }
+
         samples[i] = (int16_t)v;
+    }
+
+    /* One line per 8 chunks (512 ms): enough to tune the gain from a log,
+     * not enough to bury everything else in it. */
+    {
+        static int s_v845_n;
+
+        if ((s_v845_n++ % 8) == 0) {
+            V1024S(LOG_ERR, "[V845]] capture gain g=%d raw_peak=%d out_peak=%d %s\n",
+                   (int)g, (int)peak, (int)(peak * g),
+                   (g < AGENT_AUDIO_CAPTURE_GAIN) ? "(backed off)"
+                                                  : "(full gain)");
+        }
     }
 #else
     (void)buf;

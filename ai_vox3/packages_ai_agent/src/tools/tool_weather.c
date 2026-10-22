@@ -226,7 +226,10 @@ void weather_tool_init(void)
   pthread_attr_t attr;
 
   pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 2048);
+  /* [V852] was 2048, which cannot hold vela_https_get() (mbedTLS)
+   * plus this thread's own `char buf[2048]` + `char path[256]`.
+   * 24 KB, the same budget voice_channel gives its workers. */
+  pthread_attr_setstacksize(&attr, 24576);
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
   if (pthread_create(&tid, &attr, weather_thread, NULL) != 0)

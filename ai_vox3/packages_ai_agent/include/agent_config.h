@@ -129,7 +129,13 @@
 
 /* ── LLM ────────────────────────────────────────────────────── */
 #define AGENT_LLM_DEFAULT_MODEL ""
-#define AGENT_LLM_MAX_TOKENS 4096
+/* [V737] Was 4096.  This is a *voice* assistant: the reply is read aloud, so
+ * 4096 tokens is 16+ seconds of generation the user sits through in silence,
+ * and a long reply also forces the TTS backend to split it into several
+ * HTTPS requests (each with its own TLS handshake).  512 tokens is ~340
+ * Chinese characters - far more than any spoken answer needs, and it puts a
+ * ceiling on the worst case. */
+#define AGENT_LLM_MAX_TOKENS 512
 #define AGENT_LLM_MAX_TOKENS_OPENAI 16384
 #define AGENT_LLM_API_HOST ""
 #define AGENT_LLM_API_PATH "/v1/chat/completions"
@@ -171,7 +177,7 @@
 /* ── Cron / Heartbeat ──────────────────────────────────────── */
 #define AGENT_CRON_FILE AGENT_DATA_DIR "/cron.json"
 #define AGENT_CRON_FILE_MAX_SIZE (8 * 1024)
-#define AGENT_CRON_MAX_JOBS 16
+#define AGENT_CRON_MAX_JOBS 4  /* [V860e] 16->4: reclaim 8.5 KB DRAM bss */
 #define AGENT_CRON_CHECK_INTERVAL_MS (10 * 1000)
 #define AGENT_CRON_ID_LEN 9 /* 8 hex chars + NUL */
 #define AGENT_CRON_STACK (8 * 1024)
@@ -368,7 +374,11 @@
  * 128KB PCM ≈ 4s at 16kHz/16bit/mono; enough for typical TTS output.
  * Recording uses the same cap; 128KB ≈ 4s of audio which is fine for
  * short voice commands.  For longer recordings, increase as needed. */
-#define AGENT_VOICE_PCM_BUF_SIZE (128 * 1024)
+/* [V693] One PTT window is VOICE_PTT_MAX_SEC (8 s) of 16 kHz mono 16-bit
+ * PCM = 256 KB, and MIMO_ASR_MAX_PCM accepts exactly that.  At 128 KB
+ * accumulate_pcm_locked() dropped everything past the fourth second
+ * without saying so. */
+#define AGENT_VOICE_PCM_BUF_SIZE (256 * 1024)
 #define AGENT_VOICE_RESP_BUF_SIZE (128 * 1024)
 #define AGENT_VOICE_B64_BUF_SIZE (96 * 1024)
 

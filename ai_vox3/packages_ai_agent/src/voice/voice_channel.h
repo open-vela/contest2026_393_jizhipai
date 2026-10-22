@@ -48,6 +48,11 @@ int voice_channel_listen_start(void);
 /* Ask the listening loop to finish after the current session. */
 void voice_channel_listen_stop(void);
 
+/* [V712] Throw away the session that is currently recording: no ASR, no
+ * dispatch, no message.  The always-on listener uses it to hand the
+ * microphone back the instant the BOOT key is pressed. */
+int voice_channel_discard(void);
+
 /* Test TTS: synthesize text, save PCM to file. */
 int voice_channel_test_tts(const char *text, const char *out_path);
 

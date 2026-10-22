@@ -108,6 +108,27 @@ const char* voice_asr_get_backend(void)
     return s_active ? s_active->name : NULL;
 }
 
+/* [V693] Is a backend with this name registered?  voice_asr_recognize()
+ * calls http_asr_recognize() directly when the cloud backend fails, and a
+ * direct symbol call runs whether or not the backend was ever registered:
+ * with the self-hosted "http" backend gone that fallback would block for
+ * HTTP_ASR_CONN_MS (5 s) on a closed port every time MiMo hiccups. */
+static int voice_asr_registered(const char* name)
+{
+    if (name == NULL) {
+        return 0;
+    }
+
+    for (int i = 0; i < s_backend_count; i++) {
+        if (s_backends[i]->name &&
+            strcmp(s_backends[i]->name, name) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 int voice_asr_recognize(const unsigned char* pcm_data,
     size_t pcm_len,
     char* text_out,
@@ -144,18 +165,21 @@ int voice_asr_recognize(const unsigned char* pcm_data,
     }
 
     if (ret != 0 &&
-        (!s_active->name || strcmp(s_active->name, VOICE_ASR_HTTP_NAME) != 0)) {
+        (!s_active->name || strcmp(s_active->name, VOICE_ASR_HTTP_NAME) != 0) &&
+        voice_asr_registered(VOICE_ASR_HTTP_NAME)) {
         /* A cloud backend (e.g. "mimo") may be unreachable; retry once with
-         * the self-hosted HTTP backend when it is registered and different. */
+         * the self-hosted HTTP backend when it is registered and different.
+         *
+         * [V693] The registration test matters: the call below is a direct
+         * symbol reference, so without it this branch also fires when no
+         * "http" backend exists and waits out the full 5 s connect
+         * timeout against 42.48.185.89:19009. */
         ret = http_asr_recognize(pcm_data, pcm_len, text_out, text_cap);
     }
 
     /* [V360] ASR 环的“识别结果”留痕：有没有文本、多少字节、前 80 字节。 */
 
-    syslog(LOG_INFO, "[V360] [%s] asr result ret=%d bytes=%zu text80=%.80s\n",
-           TAG, ret,
-           (text_out != NULL) ? strlen(text_out) : (size_t)0,
-           (text_out != NULL && text_out[0] != '\0') ? text_out : "(empty)");
+    
 
     return ret;
 }
@@ -170,6 +194,21 @@ voice_asr_stream_t* voice_asr_stream_open(void)
 {
     if (!s_active) {
         syslog(LOG_ERR, "[%s] No ASR backend for streaming\n", TAG);
+        return NULL;
+    }
+
+    /* [V693] Only the volcengine backend has a streaming (WebSocket) API;
+     * every other backend is request/response.  Asking for a stream can
+     * therefore only fail, and it used to fail loudly on every press:
+     *
+     *   [volc_asr] stream: credentials not configured
+     *   [voice] pre-open ASR failed, will retry in thread
+     *   [voice] streaming ASR unavailable, batch fallback
+     *
+     * Return NULL quietly instead; the caller already reads NULL as
+     * "accumulate the PCM and recognise it in one shot on release". */
+    if (s_active->name == NULL ||
+        strcmp(s_active->name, VOICE_ASR_VOLC_NAME) != 0) {
         return NULL;
     }
 

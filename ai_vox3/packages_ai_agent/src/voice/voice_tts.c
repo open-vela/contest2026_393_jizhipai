@@ -118,44 +118,61 @@ int voice_tts_speak_stream(const char* text,
     voice_tts_chunk_cb cb,
     void* user_data)
 {
-    if (!s_active) {
-        syslog(LOG_WARNING,
-            "[%s] No TTS backend selected, using HTTP/volc fallback\n", TAG);
-    }
+  int ret;
+  int used_mimo = 0;
 
-    /* Try the self-hosted HTTP TTS first.
-     *
-     * It is reached through an IP literal, so it needs neither DNS nor
-     * internet egress -- the two things that proved unreliable on both APs.
-     * Cloud MiMo and then volc remain as fallbacks for when the device
-     * happens to sit on a healthy internet link. */
-    int ret = -ENOSYS;
-
-    /* [V359] 自建 HTTP TTS 先上：IP 直连，不需要 DNS / 公网出口，且自带
-     * 有界 connect 与每 recv 超时（见 http_tts.c）。 */
-
-    ret = http_tts_speak_stream(text, cb, user_data);
-    if (ret != 0) {
-        syslog(LOG_WARNING,
-            "[V359] [%s] self-hosted TTS failed (%d), public fallback=%d\n",
-            TAG, ret, VOICE_TTS_PUBLIC_FALLBACK);
-    }
-
-#if VOICE_TTS_PUBLIC_FALLBACK
-    if (ret != 0) {
-        if (s_active && s_active->name &&
-            strcmp(s_active->name, MIMO_TTS_BACKEND_NAME) == 0) {
-            ret = mimo_tts_speak_stream(text, cb, user_data);
+  /* [V509] Drive the chain from the selected backend.
+   *
+   * This used to call http_tts_speak_stream() first, unconditionally, and
+   * only then walk a fallback chain that started with the same call again.
+   * The reason was that the self-hosted endpoint needed neither DNS nor
+   * internet egress, which was true while the board had no working uplink.
+   * MiMo is reachable now, so that ordering only cost three connect
+   * attempts against a dead 42.48.185.89:12301 before every line of
+   * speech, and the selected backend was never really in charge.
+   */
+  if (s_active && s_active->name &&
+      strcmp(s_active->name, MIMO_TTS_BACKEND_NAME) == 0)
+    {
+      used_mimo = 1;
+      ret = mimo_tts_speak_stream(text, cb, user_data);
+      if (ret != 0)
+        {
+          syslog(LOG_WARNING,
+                 "[%s] mimo TTS failed (%d), trying volc\n", TAG, ret);
         }
     }
 
-    if (ret != 0) {
-        ret = http_tts_speak_stream(text, cb, user_data);
+#if VOICE_TTS_PUBLIC_FALLBACK
+  if (!used_mimo || ret != 0)
+    {
+      if (used_mimo)
+        {
+          ret = volc_tts_ws_synthesize_stream(text,
+                                              (volc_tts_chunk_cb)cb,
+                                              user_data);
+          if (ret != 0)
+            {
+              syslog(LOG_WARNING,
+                     "[%s] volc TTS failed (%d), trying self-hosted http\n",
+                     TAG, ret);
+            }
+        }
+      else
+        {
+          /* No cloud backend selected: go straight to the self-hosted one
+           * rather than probing the cloud endpoints first. */
+          ret = http_tts_speak_stream(text, cb, user_data);
+        }
     }
-    if (ret != 0) {
-        ret = volc_tts_ws_synthesize_stream(text,
-            (volc_tts_chunk_cb)cb, user_data);
+#else
+  if (!used_mimo)
+    {
+      syslog(LOG_ERR,
+             "[%s] no public TTS backend selected\n", TAG);
+      return -ENOSYS;
     }
 #endif
-    return ret;
+
+  return ret;
 }

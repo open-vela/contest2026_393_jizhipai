@@ -27,6 +27,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/* [V525] ensure_dns() 定义在公共区（三个平台分支都要用），所以这几个头
+ * 必须提前包含 —— 它们原本在下面的分支里才 include，公共区看不到。 */
+#include <errno.h>
+#include <stdio.h>
+#include "config/config_store.h"
+
 static const char* TAG = "netmgr";
 
 static char s_ip_str[INET_ADDRSTRLEN] = "0.0.0.0";
@@ -64,10 +70,178 @@ bool network_is_connected(void)
     return false;
 }
 
+/* [V525] 确保 resolver 已被编程 —— 任何一次拿到 IP 之后都必须调。
+ *
+ * ★★★ 这是「无语音」的唯一阻塞点，根因查清了：
+ *
+ *   NuttX 的 DNS client 只认netlib_set_ipv4dnsaddr() 设置的地址
+ *   （缺省才用编译期的 CONFIG_NETDB_DNSSERVER_IPv4ADDR）。
+ *   **它从不读 /tmp/resolv.conf。**
+ *
+ *   而本项目的网络是 network_manager 自己管的，不走 netinit 工具那条路：
+ *     - netinit_set_ipv4addrs()（唯一会设 DNS 的地方）只在跑 netinit 时执行；
+ *     - network_set_dns() 只在 network_rpmsg_init()（BLE/RPMSG 分支）
+ *       和 nsh 命令 setdns 里被调用；
+ *     - **真实硬件分支 network_wifi_connect() / network_wifi_reconnect()
+ *       从头到尾没有调用过 network_set_dns()**。
+ *
+ *   于是 getaddrinfo("token-plan-cn.xiaomimimo.com") 永远拿不到名字服务器，
+ *   [vela_tls] 打印完 TCP connect 那一行就永久静默 —— 看着像网络不通，
+ *   其实是没配 DNS。IP 直连（42.48.185.89:2301）能通，正是这个原因。
+ *
+ *   DHCP 也失败过（[V113] second DHCP attempt also failed），不能指望 DHCP
+ *   下发的 DNS，必须显式写死。
+ *
+ * ★ 为什么不复用 network_set_dns()：它定义在下面的 RPMSG 分支里，而本函数
+ *   要放在公共区（QEMU / RPMSG / 真实硬件三个分支共用），否则链接期找不到符号
+ *   —— 这个坑踩过一次：ensure_dns 放在分支内，编译过但 LD 报
+ *   undefined reference。这里直接调 netlib_set_ipv4dnsaddr() 并顺手写
+ *   resolv.conf，两件事都在本地做完。
+ */
+/* [V1041] Application-layer static IP.
+ *
+ * The K230's SD-card script hard-codes VOX3_IP = 192.168.110.154 for this
+ * board (the comment there even names our MAC 90-70-69-16-2a-3c).  DHCP
+ * currently leases us .155, so the face packets go nowhere.  netinit is
+ * left alone - it still associates and DHCPs, which keeps routing and the
+ * fallback behaviour intact - and we simply overwrite the address once an
+ * address exists.
+ *
+ * Idempotent and quiet: it reads the current address first and does
+ * nothing at all when it already matches, so it can be called from
+ * ensure_dns() on every "connected" event without flooding the log.
+ */
+static void ensure_static_ip(void)
+{
+    char ip[INET_ADDRSTRLEN];
+    struct in_addr cur;
+    struct in_addr want;
+    int rc;
+
+    if (inet_pton(AF_INET, "192.168.110.154", &want) != 1)
+      {
+        return;
+      }
+
+    memset(&cur, 0, sizeof(cur));
+    if (netlib_get_ipv4addr("wlan0", &cur) == OK &&
+        cur.s_addr == want.s_addr)
+      {
+        return;                     /* already ours, nothing to say */
+      }
+
+    /* Only d_ipaddr is rewritten by SIOCSIFADDR (netdev_ioctl.c:343), so
+     * the netmask and default route set around this call survive. */
+    rc = netlib_set_ipv4addr("wlan0", &want);
+    inet_ntop(AF_INET, &want, ip, sizeof(ip));
+    syslog(rc == OK ? LOG_INFO : LOG_ERR,
+           "[V1041] static ip %s rc=%d\n", ip, rc);
+}
+
+static void ensure_dns(void)
+{
+    static const char *const fallbacks[] = { "223.5.5.5", "119.29.29.29" };
+    char primary[64] = { 0 };
+    struct in_addr dns_addr;
+    unsigned int i;
+    FILE* fp;
+
+    /* ── [V526] 先修默认路由，再谈 DNS ──────────────────────────
+     *
+     * 板上的证据：`[V58] /proc/net/route open: 2` —— 路由表是**空的**。
+     * 没有默认路由意味着板子只能和同网段通信，出网的 TCP 和 UDP 都发不出去。
+     * 这一条解释了之前所有的现象：
+     *   - DNS 明明配成 223.5.5.5(rc=0) 却一个查询都发不出去；
+     *   - getaddrinfo() 卡在里面不返回（包根本出不去，只在本地等超时）；
+     *   - 改成 IP 直连 111.206.191.150:443 同样建不了连；
+     *   - 之前[V58] probe gw/srv/pub 全是 -110(ETIMEDOUT)，包括内网
+     *     42.48.185.89 —— 那些"能通"的印象其实也是超时。
+     *
+     * 为什么没有路由：编译期 CONFIG_NETINIT_DRIPADDR=0x0a000001 即 10.0.0.1，
+     * 那是另一个网络的网关，跟本机实际网段 192.168.110.0/24 毫无关系。
+     * DHCP 模式下这个静态值不参与路由表写入，而本项目**没有任何代码**
+     * 在 DHCP 之后补设默认路由（grep netlib_set_dripv4addr 在 packages/ 下
+     * 零命中）。
+     *
+     * 所以这里显式补上：掩码按 255.255.255.0，网关取同网段内已探测到的
+     * 192.168.110.1。写错网关的症状是"能建连但发不出去"，而完全不写
+     * 默认路由的症状是"建连就超时" —— 现象已确认是后者。
+     */
+    {
+        struct in_addr mask;
+        struct in_addr gw;
+        int rc;
+
+        inet_pton(AF_INET, "255.255.255.0", &mask);
+        rc = netlib_set_ipv4netmask("wlan0", &mask);
+        syslog(LOG_INFO, "[%s] ensure_net: netmask <- 255.255.255.0 (rc=%d)\n",
+               TAG, rc);
+
+        ensure_static_ip();
+
+        if (inet_pton(AF_INET, "192.168.110.1", &gw) == 1) {
+            rc = netlib_set_dripv4addr("wlan0", &gw);
+            syslog(LOG_INFO,
+                   "[%s] ensure_net: default route <- 192.168.110.1 (rc=%d)\n",
+                   TAG, rc);
+        }
+    }
+
+    /* 用户通过 setdns 命令存过的值优先（network_set_dns 会写进 config_store） */
+    if (claw_config_get("net.dns_primary", primary, sizeof(primary)) != OK
+        || primary[0] == '\0') {
+        strncpy(primary, fallbacks[0], sizeof(primary) - 1);
+        primary[sizeof(primary) - 1] = '\0';
+    }
+
+    if (inet_pton(AF_INET, primary, &dns_addr) != 1) {
+        syslog(LOG_ERR, "[%s] ensure_dns: bad stored DNS '%s', using %s\n",
+               TAG, primary, fallbacks[0]);
+        strncpy(primary, fallbacks[0], sizeof(primary) - 1);
+        primary[sizeof(primary) - 1] = '\0';
+        inet_pton(AF_INET, primary, &dns_addr);
+    }
+
+    /* 关键这一句：NuttX resolver 真正读的东西 */
+    for (i = 0; i < 2; i++) {
+        struct in_addr a;
+        int rc;
+
+        inet_pton(AF_INET, primary, &a);
+        rc = netlib_set_ipv4dnsaddr(&a);
+        syslog(LOG_INFO, "[%s] ensure_dns: resolver <- %s (rc=%d)\n",
+               TAG, primary, rc);
+        if (rc == OK) {
+            break;
+        }
+
+        /* 换用备用服务器再试 */
+        primary[0] = '\0';
+        strncpy(primary, fallbacks[i + 1 < 2 ? i + 1 : 1],
+                sizeof(primary) - 1);
+        primary[sizeof(primary) - 1] = '\0';
+    }
+
+    /* 同时写 resolv.conf（部分应用/工具会读它）。写不了不算失败。 */
+    fp = fopen("/tmp/resolv.conf", "w");
+    if (fp) {
+        fprintf(fp, "nameserver %s\n", primary);
+        fprintf(fp, "nameserver %s\n", fallbacks[1]);
+        fclose(fp);
+    } else {
+        syslog(LOG_WARNING, "[%s] ensure_dns: cannot write /tmp/resolv.conf "
+               "(non-fatal, netlib resolver already programmed)\n", TAG);
+    }
+}
+
 int network_wait_connected(uint32_t timeout_ms)
 {
     if (timeout_ms == 0) {
-        return network_is_connected() ? OK : ERROR;
+        if (network_is_connected()) {
+            ensure_dns();
+            return OK;
+        }
+        return ERROR;
     }
 
     struct timespec deadline;
@@ -82,6 +256,9 @@ int network_wait_connected(uint32_t timeout_ms)
     while (1) {
         if (network_is_connected()) {
             syslog(LOG_INFO, "[%s] Network connected: %s\n", TAG, s_ip_str);
+            /* [V525] 一拿到 IP 就编程 resolver —— NuttX 不会从 DHCP 或
+             * resolv.conf 拿 DNS，不设就是永久解析失败。见 ensure_dns() 注释。 */
+            ensure_dns();
             return OK;
         }
 
@@ -578,17 +755,20 @@ int network_set_dns(const char* primary, const char* secondary)
 
     fp = fopen("/tmp/resolv.conf", "w");
     if (!fp) {
-        syslog(LOG_ERR, "[%s] Cannot open /tmp/resolv.conf: %d\n",
-            TAG, errno);
-        return -errno;
+        /* [V525] resolv.conf 写不了**不能**直接返回。
+         *
+         * 原来这里 `return -errno;`，把后面的 netlib_set_ipv4dnsaddr() 跳过了 ——
+         * 而那恰恰是 NuttX resolver 真正会读的东西。结果是：就算 /tmp 建不出来，
+         * DNS 也永远没被设置，gethostbyname() 全部超时。
+         * 这就是「有 resolv.conf 修复却依然解析失败」的原因之一。 */
+        
+    } else {
+        fprintf(fp, "nameserver %s\n", primary);
+        if (secondary && secondary[0] != '\0') {
+            fprintf(fp, "nameserver %s\n", secondary);
+        }
+        fclose(fp);
     }
-
-    fprintf(fp, "nameserver %s\n", primary);
-    if (secondary && secondary[0] != '\0') {
-        fprintf(fp, "nameserver %s\n", secondary);
-    }
-
-    fclose(fp);
 
     /* [DNS-FIX] Program the NuttX resolver as well.
      *

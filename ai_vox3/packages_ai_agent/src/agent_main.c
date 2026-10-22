@@ -114,6 +114,59 @@ bool agent_shutdown_requested(void)
     return g_shutdown_requested;
 }
 
+/* [V510] 开机问候（异步）。
+ *
+ * 原来这里是三次同步重试：
+ *
+ *     for (int i = 0; i < 3; i++) {
+ *       ret = voice_channel_speak("桌面小跟班语音就绪");
+ *       if (ret == 0) break;
+ *       sleep(3);
+ *     }
+ *
+ * 而 voice_channel_speak() 是**同步阻塞**的：它把整段合成流式取回并驱动
+ * 播放，走完才返回。上面那段注释（v73/v77）早就记了这个坑——"greeting first
+ * 会让板子变哑"，因为它挡住了后面的 voice_channel_listen_start()。
+ *
+ * 以前 MiMo 流式路径从未真正执行过（speak_stream 优先连那个不存在的自建
+ * 端点，每次秒失败），所以这个隐患一直没爆。v509 把 MiMo 打通后，它第一次
+ * 真跑：192KB malloc + 完整 TLS + 阻塞播放，还重试三次，全卡在启动主路径上，
+ * 板子直接进不了 shell。
+ *
+ * 改为：独立低优先级线程，延迟几秒，只播一次，失败就记日志放弃。
+ * 问候本来就是装饰性的，聆听才是功能。
+ */
+static void *boot_greeting_task(void *arg)
+{
+  /* [V876] This is the last ai_agent path that still opened audio:
+   * voice_channel_speak() -> /dev/audio/pcm0p.  aivox already owns pcm0p,
+   * so this collided with it (same EXCCAUSE=001c panic as H1).
+   *
+   * The greeting is decorative -- listening is the feature -- and there is
+   * only meant to be one voice assistant.  Bail out before touching any
+   * audio device.  Delete these two lines to bring the greeting back. */
+  (void)arg;
+  return NULL;
+  const int delay_s = 12;
+
+  syslog(LOG_INFO, "[greeting] waiting %d s before speaking\n", delay_s);
+  sleep(delay_s);
+
+  syslog(LOG_INFO, "[greeting] speaking (one attempt, async)\n");
+  if (voice_channel_speak("桌面小跟班语音就绪") == 0)
+    {
+      syslog(LOG_INFO, "[greeting] done\n");
+    }
+  else
+    {
+      syslog(LOG_WARNING,
+             "[greeting] failed, ignored - listening is unaffected\n");
+    }
+
+  return NULL;
+}
+
+
 /* ── Network watcher (async) ──────────────────────────────────── */
 
 #ifdef CONFIG_AI_AGENT_NET_RPMSG
@@ -788,8 +841,7 @@ static void* spk_smoke_task(void* arg)
         spk_local_test();   /* 保留引用，避免 unused-function 告警 */
       }
 
-    syslog(LOG_INFO,
-           "[V333] early speaker smoke test DISABLED (V333)\n");
+    
     return NULL;
 
     /* [V315] Wait out the boot-time WiFi association storm: while the
@@ -830,7 +882,7 @@ static void* voice_boot_test_task(void* arg)
      * The chain is already proven ("[SPKTEST] beeps done (audible =>
      * speaker chain OK)" every boot), and the greeting below is a better
      * audible proof anyway because it exercises TTS + playback + network. */
-    syslog(LOG_INFO, "[V374] boot speaker smoke test DISABLED\n");
+    
 
     sleep(VOICE_BOOT_TEST_DELAY_SEC);
 
@@ -843,7 +895,7 @@ static void* voice_boot_test_task(void* arg)
      * 所以把采集探针挪到链路就绪之后；拿不到链路也照样跑，不隐藏问题。 */
     if (network_wait_connected(60000) != OK)
       {
-        syslog(LOG_ERR, "[V400] no link after 60s - capture probe anyway\n");
+        
       }
 
     /* [V384] Capture probe FIRST, network gate second.
@@ -880,7 +932,6 @@ static void* voice_boot_test_task(void* arg)
         native_capture_selftest();
     }
 #else
-    syslog(LOG_INFO, "[V401] capture probe SKIPPED (CAPTURE_PROBE=0)\n");
 #endif
 
     /* [V81] Wait for the link before opening the microphone.
@@ -920,15 +971,52 @@ static void* voice_boot_test_task(void* arg)
      * apart from the SPKTEST beeps.  The greeting is the audible proof that the
      * whole voice chain works, so run it first. */
 
-    for (int i = 0; i < 3; i++) {
-        syslog(LOG_INFO, "[voice_btest] 1/2 greeting attempt %d\n", i + 1);
-        ret = voice_channel_speak("桌面小跟班语音就绪");
-        if (ret == 0) {
-            syslog(LOG_INFO, "[voice_btest] greeting OK attempt %d\n", i + 1);
-            break;
-        }
-        syslog(LOG_WARNING, "[voice_btest] greeting failed rc=%d\n", ret);
-        sleep(3);
+    /* [V510] The greeting now runs on its own thread. See the comment on
+     * boot_greeting_task(): a synchronous speak() here blocked the start of
+     * listening for the whole synthesis, and the three retry loop multiplied
+     * the stall. Nothing below this point may depend on it. */
+    {
+        pthread_attr_t attr;
+        pthread_t th;
+        /* Sizes to try, largest first.  boot_greeting_task() runs the FULL
+         * TTS playback chain (speak -> mimo https -> tts_stream_cb ->
+         * audio_playback_write), which needs a real audio stack: the 2 KB
+         * it used to get overflowed the moment PCM arrived and killed the
+         * board with EXCCAUSE=0014.  Never go below 4096 (the NuttX
+         * default).  8192 is the smallest size observed to survive the
+         * chain, but we ask for more first and settle for what we get. */
+        static const size_t stacks[] = { 16384, 12288, 8192, 4096 };
+        size_t i;
+        int rc = -1;
+        size_t chosen = 0;
+
+        for (i = 0; i < sizeof(stacks) / sizeof(stacks[0]); i++)
+          {
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, stacks[i]);
+            rc = pthread_create(&th, &attr, boot_greeting_task, NULL);
+            pthread_attr_destroy(&attr);
+            if (rc == 0)
+              {
+                chosen = stacks[i];
+                break;
+              }
+            syslog(LOG_WARNING,
+                   "[greeting] thread create with %u B failed (%d), trying "
+                   "smaller\n", (unsigned)stacks[i], rc);
+          }
+
+        if (rc == 0)
+          {
+            syslog(LOG_INFO, "[greeting] thread started (stack %u B)\n",
+                   (unsigned)chosen);
+          }
+        else
+          {
+            syslog(LOG_WARNING,
+                   "[greeting] thread create failed at every size, "
+                   "skipping\n");
+          }
     }
 
     /* [V381] Automatic capture probe: see native_capture_selftest() in
@@ -959,7 +1047,6 @@ static void* voice_boot_test_task(void* arg)
         native_capture_selftest();
     }
 #else
-    syslog(LOG_INFO, "[V401] capture probe SKIPPED (CAPTURE_PROBE=0)\n");
 #endif
 
     /* 2/2 Microphone.  v69 releases the channel right after the recording
@@ -980,8 +1067,58 @@ static void* voice_boot_test_task(void* arg)
      * same failure mode as the old faced animation: a permanently running
      * DMA task starves the WiFi blob.
      * Wake is the BOOT key (button PTT); it needs no background capture. */
-    syslog(LOG_INFO,
-           "[V374] always-on listening DISABLED - press BOOT to talk\n");
+    /* [V712] *** Always-on listening re-enabled. ***
+     *
+     * V374 turned it off because a permanently open capture kept the I2S TX
+     * clock-keeper streaming silence into the transmitter, which starved the
+     * WiFi blob (STA_DISCONNECT reason=8 then 101, no TCP at all).  Every part
+     * of that chain is fixed now: v692 cleared I2S_TX_STOP_EN so the
+     * transmitter stops when idle, v694 re-arms the I2S clock only when a
+     * capture really starts, v695 fixed the shared upper-half gate that
+     * silently skipped audio_start(), and v711 fixed the playback pipeline
+     * that was killing the board outright.
+     *
+     * The listener is not a free-running DMA task either -- it opens a
+     * session, waits at most VOICE_LISTEN_NO_SPEECH_MS for speech, closes it
+     * and settles, so the radio sees a duty cycle rather than a saturated bus.
+     *
+     * Kill switch, so this can be turned off without a reflash:
+     *     touch /tmp/wakeoff.txt     -> listening stays off for this boot */
+
+    {
+      FILE *woff = fopen("/tmp/wakeoff.txt", "r");
+      /* [V876] aivox owns the microphone.
+       *
+       * This gate used to be controlled only by /tmp/wakeoff.txt, which
+       * does not exist, so wake_on was 1 and voice_channel_listen_start()
+       * happily returned 0 -- starting ai_agent's own always-on listening
+       * even though [V872] had already disabled voice_channel_init().
+       * The result was two owners of one I2S port: aivox holds pcm0c (and
+       * pcm0p as its capture clock, audio_capture_native.c:122
+       * CAP_CLOCK_DEV) while ai_agent tried to do the same.  That is what
+       * produces the EXCCAUSE=001c LOAD_PROHIBITED panic inside vsyslog.
+       *
+       * The user asked for exactly one voice assistant, so force the gate
+       * shut rather than depending on a file. */
+      int   wake_on = 0;
+
+      if (woff != NULL)
+        {
+          fclose(woff);
+        }
+
+      if (wake_on && voice_channel_listen_start() == 0)
+        {
+          syslog(LOG_INFO,
+                 "[V712] always-on listening ENABLED - say the wake word\n");
+        }
+      else
+        {
+          syslog(LOG_INFO,
+                 "[V712] always-on listening DISABLED - press BOOT to talk\n");
+        }
+    }
+
     (void)ret;
 
     return NULL;
@@ -1345,7 +1482,6 @@ static int run_init_to(const char* name, int (*fn)(void), int timeout_ms)
 /* [EARLY-VOICE] set once the voice channel has been brought up during
  * Phase 3, so the later phases do not initialise it a second time. */
 static int s_voice_brought_up_early;
-
 int ai_agent_main(int argc, char* argv[])
 {
     /* Product build: discard stdout/stderr (USB CDC blocks when no host
@@ -1376,6 +1512,51 @@ int ai_agent_main(int argc, char* argv[])
             TAG);
     }
 #endif
+
+    /* [OFFLINE-FIRST] 离线外设初始化，必须放在网络门之前。
+     *
+     * network_wait_connected(90000) 在网络不通时（实测：拿得到 IP 但 TCP 全
+     * -110，板子反复重关联）永远等不到"已连接"，P0~P3 全部阶段都不会执行，
+     * 舵机等外设就永远不会被初始化。舵机/台灯/触摸/震动都不依赖网络，
+     * 所以按 [EARLY-VOICE] 同样的思路提到这里，先于 boot storm 起来。 */
+    {
+        extern int servo_init(void);
+        extern int servo_self_test(void);
+
+        syslog(LOG_INFO, "[OFFLINE-FIRST] servo init before network gate\n");
+        servo_init();
+        servo_self_test();
+
+        /* [V502] 舵机保活：周期性重发当前角度，防止被负载推偏或
+         *   通道被别人 STOP。必须在 servo_init() 之后。 */
+        {
+            extern int servo_keepalive_start(void);
+
+            servo_keepalive_start();
+        }
+
+        /* [V503] K230 人脸跟踪云台：bind udp/3333 收 F,<cx>,<cy>,<w>,<h>,<conf>，
+         *   按绝对映射律驱动 PAN/TILT。K230 侧脚本与小智固件通用，零改动。
+         *   舵机没起来时它会自己报错退出，不影响语音。 */
+        {
+            extern int companion_face_start(void);
+
+            if (companion_face_start() < 0)
+                {
+                    syslog(LOG_ERR,
+                            "[OFFLINE-FIRST] face tracker not started\n");
+                }
+        }
+
+
+        /* 触觉情绪：摸它点头(mood+1) / 拍它摇头(mood-1)。
+         * 纯离线，不依赖网络，直接在这里起轮询线程。 */
+        {
+            extern int companion_mood_start(void);
+
+            companion_mood_start();
+        }
+    }
 
     /* [WIFI-FIX-R27] Wait for netinit to finish associating before this app's
      * boot storm starts.
@@ -1414,9 +1595,28 @@ int ai_agent_main(int argc, char* argv[])
     }
 
     /* ── Phase 0: Timezone ──────────────────────────────────── */
-    /* Set TZ before any time calls so localtime_r returns CST+8.
-     * NuttX with CONFIG_LIBC_LOCALTIME+CONFIG_LIBC_ZONEINFO supports
-     * both POSIX ("CST-8") and zoneinfo ("Asia/Shanghai") formats. */
+    /* [V758] TZ is INERT in this build.  It is still exported because
+     * something else may read the environment, but it does NOT make
+     * localtime_r() return CST+8 -- the old comment below this block
+     * claimed it did, and that claim is wrong:
+     *
+     *   nuttx/libs/libc/time/Make.defs compiles lib_localtime.c (the only
+     *   TZ-aware implementation; its line 2792 is the tree's sole
+     *   getenv("TZ")) only under CONFIG_LIBC_LOCALTIME, and nuttx/.config
+     *   has "# CONFIG_LIBC_LOCALTIME is not set".  The localtime_r() we
+     *   link is lib_gmtimer.c:345, whose body is just
+     *       return gmtime_r(timep, result);
+     *   -- plain UTC, and no CONFIG_LIBC_TZ_OFFSET fallback exists.
+     *
+     * So never rely on localtime_r()/setenv("TZ") for wall-clock text.
+     * Use the house convention instead (tool_get_time.c:93,
+     * memory_store.c:42, agent_loop.c:612, context_builder.c:153):
+     *
+     *     time_t local_epoch = now + 8 * 3600;
+     *     gmtime_r(&local_epoch, &tm_now);
+     *
+     * xiaozhi_ui_main.c used to be the sole localtime_r() caller, which
+     * is why the on-screen clock alone sat eight hours behind. */
     setenv("TZ", AGENT_TIMEZONE, 1);
 #ifdef CONFIG_LIBC_LOCALTIME
     tzset();
@@ -1492,6 +1692,22 @@ int ai_agent_main(int argc, char* argv[])
         rc = run_init_to("llm_router_init", llm_router_init, 12000);
         BOOT_LOG_RC(&t0, "P3", "llm_router_init", rc);
 
+        /* [V853] Tool registry BEFORE agent_loop: agent_loop reads
+         * tool_registry_get_tools_json() once, before its message loop, and
+         * reuses that string for every request (agent_loop.c:1463).  With
+         * the registry initialised later the JSON was captured mid-
+         * registration -- the log showed "Tools JSON built (5 builtin + 1
+         * providers)" / "Tools JSON loaded: 949 bytes" although 41 tools
+         * were registered -- so the LLM only ever saw a handful of tools.
+         * run_init_to() bounds both at 12 s, so a hang delays voice by at
+         * most that much and cannot wedge the chip.
+         */
+        rc = run_init_to("tool_registry_init", tool_registry_init, 12000);
+        BOOT_LOG_RC(&t0, "P3", "tool_registry_init", rc);
+
+        rc = run_init_to("tool_guard_init", tool_guard_init, 12000);
+        BOOT_LOG_RC(&t0, "P3", "tool_guard_init", rc);
+
         /* ── [EARLY-VOICE] ────────────────────────────────────────────
          * Everything voice needs (config store, message bus, LLM router)
          * is initialised at this point.  Later initialisers on this board
@@ -1504,9 +1720,8 @@ int ai_agent_main(int argc, char* argv[])
         rc = run_init_to("voice_channel_init", voice_channel_init, 12000);
         BOOT_LOG_RC(&t0, "P3", "voice_channel_init(early)", rc);
 
-        /* [SERVO] 上电初始化舵机并自检(0->180->90 扫一遍, 肉眼可见转头) */
-        servo_init();
-        servo_self_test();
+        /* [OFFLINE-FIRST] 舵机初始化已移到网络门之前的 [OFFLINE-FIRST] 块，
+         * 此处不再重复执行（避免每次 boot storm 都甩一次舵机）。 */
 
         if (agent_task_create(outbound_dispatch_task, "outbound",
                 AGENT_OUTBOUND_STACK, NULL, AGENT_OUTBOUND_PRIO) == OK) {
@@ -1524,8 +1739,7 @@ int ai_agent_main(int argc, char* argv[])
                 AGENT_OUTBOUND_STACK, NULL, AGENT_OUTBOUND_PRIO) == OK) {
             BOOT_LOG(&t0, "P3", "voice boot self-test started (early)");
         } else {
-            syslog(LOG_ERR, "[%s] [V398] voice boot self-test task FAILED\n",
-                   TAG);
+            
         }
 #endif
 
@@ -1579,12 +1793,6 @@ int ai_agent_main(int argc, char* argv[])
         rc = OK;
         BOOT_LOG_RC(&t0, "P3", "node_manager_init", rc);
 #endif
-
-        rc = run_init_to("tool_registry_init", tool_registry_init, 12000);
-        BOOT_LOG_RC(&t0, "P3", "tool_registry_init", rc);
-
-        rc = run_init_to("tool_guard_init", tool_guard_init, 12000);
-        BOOT_LOG_RC(&t0, "P3", "tool_guard_init", rc);
 
         /* Skills must init AFTER tool_registry so executable skills
          * can register themselves as tools. */
@@ -1737,7 +1945,6 @@ int ai_agent_main(int argc, char* argv[])
         int rc = nsh_commands_start();
         BOOT_LOG_RC(&t0, "P6", "nsh_commands_start", rc);
     }
-
 
 #if 1  /* [V398] 原为 #ifdef CONFIG_AI_AGENT_VOICE_BOOT_TEST；该宏是外部包符号，nuttx olddefconfig 每次都会丢弃，导致整个自检代码从未编译 */
     if (!s_voice_brought_up_early) {

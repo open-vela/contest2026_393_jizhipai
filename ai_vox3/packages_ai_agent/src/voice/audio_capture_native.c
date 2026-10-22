@@ -44,6 +44,32 @@
 #include <syslog.h>
 #include <unistd.h>
 
+/* [V1024] Probe gate.
+ *
+ * This build carries ~60 probe lines/s during a reply, and a few
+ * of them ([V810], [V1012]) dump raw PCM straight at the console.
+ * Console throughput here is ~4300 chars/s with an 8 KB ring, so a
+ * printf blocks hard once it fills.  At 60 lines/s the audio thread
+ * spends most of its budget inside printf, which is itself a source
+ * of the stutter we are trying to measure.
+ *
+ * g_v1024_quiet == 1 suppresses every [Vnnn] printf except the
+ * handful of load-bearing ones (see KEEP in the patch script).
+ * Flip it to 0 at runtime from NSH to bring them all back.
+ */
+#ifdef __cplusplus
+extern "C" int g_v1024_quiet;
+#else
+extern int g_v1024_quiet;
+#endif
+
+#ifndef V1024_QUIET
+#define V1024_QUIET 1
+#endif
+#define V1024P(...) do { if (V1024_QUIET == 0) printf(__VA_ARGS__); } while (0)
+#define V1024S(lvl, ...) do { if (V1024_QUIET == 0) syslog(lvl, __VA_ARGS__); } while (0)
+
+
 /* [V85] Cross-module diagnostic; diag_report() lives in voice/http_tts.c.
  * Rate-limited because a 1 Hz poll would otherwise fill the 2301 channel. */
 
@@ -70,7 +96,23 @@ extern volatile int          g_v94_rxonly;
 
 extern volatile int          g_v380_loopback;
 extern volatile int          g_v380_txmaster;
-static int                   s_v380_phase = 1;
+/* [V660] Capture-path health dump, implemented in esp32s3_i2s.c and called
+ * on the capture thread (NOT the interrupt stack). */
+extern void esp32s3_i2s_rx_health(void);
+extern void esp32s3_i2s_rx_flush(void);   /* [V697] release in-flight RX bufs */
+/* [V858] Re-lock the receiver before this capture arms its buffers. */
+extern void esp32s3_i2s_v858_capture_begin(void);
+extern void esp32s3_i2s_v858_heal(void);
+extern uint32_t esp32s3_i2s_v858_rxconf(void);
+/* [V644] Diagnostic residue retired: phase 1 armed the I2S internal
+ * loopback (g_v380_loopback = 1) inside the *production* capture prime
+ * path, because nothing but native_capture_abort() ever advanced the
+ * phase past 1.  Flipping that flag mid-capture makes
+ * esp32s3_i2s_set_rxonly() fail its early-return test and stop BOTH
+ * engines while the receiver is already streaming -- exactly the
+ * "EXCCAUSE=001c task: es8311" signature that [V381]/[V379] recorded.
+ * Start in phase 2: loopback OFF, TX master kept, real codec. */
+static int                   s_v380_phase = 2;
 static void nc_probe(const char *tag)
 {
     static int s_n;
@@ -78,6 +120,11 @@ static void nc_probe(const char *tag)
     s_n++;
     if (s_n <= 12 || (s_n % 20) == 0) {
         diag_report(tag);
+        /* [V660] diag_report() does not reach /dev/kmsg, so every NC_* tag
+         * (NC_ST_BEG / NC_ST_OK_* / NC_MQ_GIVEUP / re-arm) has been
+         * invisible to the serial log all along.  Mirror it into syslog;
+         * the counter cap keeps this from becoming a flood. */
+        syslog(LOG_INFO, "[audio_cap_nat] [NC] %s (n=%d)\n", tag, s_n);
     }
 }
 
@@ -203,7 +250,15 @@ static void cap_clock_stop(void)
                                      * TX (they never run concurrently, V89).
                                      * 4 would need +16KB static BSS, which
                                      * shifts .bss and breaks WiFi assoc. */
-#define CAP_FALLBACK_BUFSIZE   4096
+/* [V688] 4092, not 4096.
+ *
+ * The GDMA splits a 4096-byte buffer into a 4095-byte descriptor plus a
+ * 1-byte tail, and only the FIRST EOF-marked descriptor is ever counted
+ * (see the V687 note in esp32s3_i2s.c).  4092 is
+ * ESP32S3_DMA_BUFLEN_MAX_4B_ALIGNED, so the whole buffer fits in ONE
+ * descriptor and the EOF always lands on the descriptor that holds it. */
+
+#define CAP_FALLBACK_BUFSIZE   4092
 
 #define CAP_MAX_NBUFFERS       2   /* [V312] see CAP_FALLBACK_NBUFFERS */
 #define CAP_MAX_BUFSIZE        16384
@@ -235,7 +290,18 @@ struct native_cap_s {
     volatile int started;
     volatile int stopped;
     int complete;
+
+    /* [V743] consecutive empty mq waits.  This used to be a function-local
+     * static, i.e. process-global and never reset: after six timeouts in the
+     * whole uptime, read() gave up instantly on every later session, so the
+     * board could never capture speech again. */
+
+    int mq_timeouts;
 };
+
+/* [V698] guard every cap->freeq[] push (defined further down) */
+
+static void cap_v698_push(struct native_cap_s* cap, struct ap_buffer_s* apb);
 
 /* Fetch the next filled buffer from the mq (or keep draining stale
  * empties).  Returns 1 with cap->pending set, 0 on timeout, -1 when the
@@ -249,8 +315,6 @@ static int cap_next_filled(struct native_cap_s* cap)
     while (1) {
         ret = native_mq_receive_timed(cap->mq, &msg, CAP_MSG_TIMEOUT_SEC);
         if (ret <= 0) {
-            static int s_to;
-
             if (cap->stopped) {
                 nc_probe("NC_MQ_STOP");
                 return -1;
@@ -262,8 +326,8 @@ static int cap_next_filled(struct native_cap_s* cap)
              * Count the empty waits and give up, so the caller sees -EIO
              * and can restart the pipeline instead of hanging. */
 
-            s_to++;
-            if ((s_to % 3) == 0) {
+            cap->mq_timeouts++;
+            if ((cap->mq_timeouts % 3) == 0) {
                 char tb[48];
 
                 snprintf(tb, sizeof(tb),
@@ -276,7 +340,7 @@ static int cap_next_filled(struct native_cap_s* cap)
                 diag_report(tb);
             }
 
-            if (s_to >= CAP_MQ_MAX_TIMEOUTS) {
+            if (cap->mq_timeouts >= CAP_MQ_MAX_TIMEOUTS) {
                 nc_probe("NC_MQ_GIVEUP");
                 return -1;
             }
@@ -305,20 +369,69 @@ static int cap_next_filled(struct native_cap_s* cap)
             if (((struct ap_buffer_s*)msg.u.ptr)->nbytes > 0) {
                 cap->pending = (struct ap_buffer_s*)msg.u.ptr;
                 cap->pending_off = 0;
+
+                /* [V743] real audio arrived: the silence streak is over.
+                 * Without this the counter is "cumulative for the session"
+                 * instead of "consecutive", and a talkative session with a
+                 * few empty polls still tripped CAP_MQ_MAX_TIMEOUTS and
+                 * dropped a perfectly good utterance. */
+
+                cap->mq_timeouts = 0;
                 return 1;
             }
 
             /* Empty buffer (returned on stop / spurious): keep it for
              * re-arming instead of dropping it. */
 
-            cap->freeq[cap->nfree++] = (struct ap_buffer_s*)msg.u.ptr;
+            cap_v698_push(cap, (struct ap_buffer_s*)msg.u.ptr);
             break;
 
         case AUDIO_MSG_COMPLETE:
-            cap->complete = 1;
-            syslog(LOG_INFO, "[%s] driver completed capture\n", TAG);
-            if (cap->outstanding <= 0 && !cap->pending) {
-                return -1;
+            /* [V688] NEVER let this end a capture.
+             *
+             * AUDIO_CALLBACK_COMPLETE is raised by the ES8311 *worker
+             * thread* as it shuts down
+             * (drivers/audio/es8311.c:2766 "Send an AUDIO_MSG_COMPLETE
+             * message to the client"), i.e. it is a playback-side
+             * teardown notice.  Since v647 pcm0p and pcm0c share one
+             * upper half, that notice is delivered to the capture
+             * client's mq as well: v687 logged
+             *   "[audio_cap_nat] driver completed capture"
+             * 0.2 s into every PTT session, and because outstanding was
+             * back to 0 the read loop returned -EPIPE and discarded a
+             * capture that was still running.
+             *
+             * A capture ends when WE say so (native_capture_stop), or
+             * when the starve detector in cap_next_filled() gives up --
+             * never because a *playback* instance finished. */
+
+            /* [V693] The comment above is right; the code was not.
+             *
+             * cap->complete is read by native_capture_read(): on the very
+             * next poll with no filled buffer it returns -EPIPE (-32),
+             * which recording_thread() takes as a fatal error.  That path
+             * runs recording_cleanup_locked(), which frees the PCM that
+             * has been accumulated and resets the state to VOICE_IDLE;
+             * voice_channel_stop_with_text() then sees
+             * state != VOICE_RECORDING, returns -EINVAL before issuing any
+             * ASR request, and the UI stays on the thinking prompt for
+             * ever.  v692 showed it on every PTT session, ~190 ms in:
+             *
+             *   [voice] capture read returned -32, stopping
+             *   [voice] abnormal exit, cleaning up
+             *
+             * A playback instance shutting down is not a capture event.
+             * Log it (twice, then stay quiet) and drop it. */
+            {
+              static int s_v693_complete_seen;
+
+              if (s_v693_complete_seen < 2)
+                {
+                  s_v693_complete_seen++;
+                  syslog(LOG_INFO,
+                      "[%s] (ignored) complete notice from the playback side\n",
+                      TAG);
+                }
             }
             break;
 
@@ -336,12 +449,28 @@ static int cap_next_filled(struct native_cap_s* cap)
  * fill it again.  After stop/abort the buffer just goes to the free
  * pool.  Returns 0 or -errno. */
 
+/* [V698] cap->freeq is calloc(cap->nbuffers, sizeof(*cap->freeq)), so
+ * pushing when nfree == nbuffers writes past the array and corrupts whatever
+ * heap block follows it.  Count it, report it, and drop the entry rather
+ * than scribbling over the heap. */
+
+static void cap_v698_push(struct native_cap_s* cap, struct ap_buffer_s* apb)
+{
+    if (cap->nfree >= cap->nbuffers) {
+        V1024S(LOG_ERR, "[V698]] *** freeq OVERFLOW nfree=%d nb=%d apb=%p\n",
+               cap->nfree, cap->nbuffers, apb);
+        return;
+    }
+
+    cap->freeq[cap->nfree++] = apb;
+}
+
 static int cap_rearm(struct native_cap_s* cap, struct ap_buffer_s* apb)
 {
     int ret;
 
     if (cap->stopped || !cap->started) {
-        cap->freeq[cap->nfree++] = apb;
+        cap_v698_push(cap, apb);
         return 0;
     }
 
@@ -351,7 +480,7 @@ static int cap_rearm(struct native_cap_s* cap, struct ap_buffer_s* apb)
     ret = native_enqueue_buffer(cap->fd, apb);
     if (ret < 0) {
         syslog(LOG_ERR, "[%s] re-arm enqueue failed: %d\n", TAG, ret);
-        cap->freeq[cap->nfree++] = apb;
+        cap_v698_push(cap, apb);
         return ret;
     }
 
@@ -438,6 +567,12 @@ int native_capture_open(native_cap_t** out_cap, const char* dev_path,
             ? CAP_MAX_BUFSIZE : (size_t)bufinfo.buffer_size;
     }
 
+    /* [V688] One GDMA descriptor per buffer -- see CAP_FALLBACK_BUFSIZE. */
+
+    if (buf_size > 4092u) {
+        buf_size = 4092u;
+    }
+
     cap->apbs = calloc(cap->nbuffers, sizeof(*cap->apbs));
     cap->freeq = calloc(cap->nbuffers, sizeof(*cap->freeq));
     if (!cap->apbs || !cap->freeq) {
@@ -489,6 +624,22 @@ int native_capture_start(struct native_cap_s* cap)
      * ADC DMA has somewhere to put the first frames.  Each step is probed
      * because if start() never returns, AC_ST_BEG is the last thing the
      * board ever says and there is no way to tell enqueue from ioctl. */
+
+    /* [V858] *** Re-lock the receiver before anything is armed. ***
+     *
+     * A capture that starts on a port a playback has just walked away
+     * from inherits the transmitter in its playback shape, and the
+     * receiver sitting at whatever bit offset that left behind; the
+     * [V382] clock-only start inside i2s_rx_channel_start() is skipped
+     * in exactly that case (its guard is "if TX is not already
+     * started"), and i2s_rx_channel_start() itself early-returns once
+     * priv->rx_started is set, so it cannot repair it either.
+     *
+     * Do it here, before the prime loop, so no descriptor of ours is
+     * in flight when the modules are reset.  The counter part in
+     * voice_channel.c heals a capture that froze mid-session. */
+
+    esp32s3_i2s_v858_capture_begin();
 
     nc_probe("NC_ST_BEG");
 
@@ -556,7 +707,7 @@ int native_capture_start(struct native_cap_s* cap)
          */
 
         g_v380_loopback = 1;
-        syslog(LOG_INFO, "[V383] boot self-test: internal loopback armed\n");
+        
       }
 
     for (i = 0; i < cap->nfree; i++) {
@@ -608,6 +759,13 @@ int native_capture_start(struct native_cap_s* cap)
         snprintf(ob, sizeof(ob), "NC_ST_OK_%d", cap->outstanding);
         nc_probe(ob);
     }
+
+    /* [V660] Ask the I2S layer whether the clocks are actually moving.  The
+     * v658 field run captured a constant peak=6, which is neither the [V380]
+     * loopback figure (8) nor live microphone audio, so the first thing to
+     * establish is whether MCLK/BCLK/WS/DIN are toggling at all. */
+    esp32s3_i2s_rx_health();
+
     return 0;
 }
 
@@ -662,6 +820,11 @@ int native_capture_read(struct native_cap_s* cap, void* buf, size_t len)
               size_t j;
               size_t nz = 0;
               long peak = 0;
+              /* [V729] AC statistics over the whole buffer. */
+              long v729min = 0;
+              long v729max = 0;
+              unsigned long long v729sq = 0ULL;
+              unsigned long v729cnt = 0UL;
 
               s_v380_buf++;
 
@@ -669,6 +832,29 @@ int native_capture_read(struct native_cap_s* cap, void* buf, size_t len)
                 {
                   long v = (long)(short)((unsigned)vp[j]
                                           | ((unsigned)vp[j + 1] << 8));
+                  /* [V729] Whole-buffer AC statistics.  The [V380]
+                   * peak is max|sample|, so it is dominated by the
+                   * codec's slow DC wander, and the 8 samples
+                   * printed by [V718] span 0.5 ms so their range
+                   * only sees the top octave.  Both of those are
+                   * noise generated AFTER the MIC PGA, which is
+                   * why the v728 REG16 sweep (0x04 -> 0xC4) moved
+                   * neither of them.  Buffer-wide min/max and mean
+                   * square do cover the speech band, which does go
+                   * through the PGA. */
+                  if (v < v729min)
+                    {
+                      v729min = v;
+                    }
+
+                  if (v > v729max)
+                    {
+                      v729max = v;
+                    }
+
+                  v729sq += (unsigned long long)((long)v * (long)v);
+                  v729cnt++;
+
 
                   if (v < 0)
                     {
@@ -686,13 +872,100 @@ int native_capture_read(struct native_cap_s* cap, void* buf, size_t len)
                     }
                 }
 
+              /* [V899] Bit-phase sanity check.  On a bad boot the RX path
+               * comes up with the wrong I2S clock role and every sample is the
+               * healthy stream shifted right by 11 bits: the raw-byte OR of the
+               * DMA buffer collapses from 0x0000fffc to 0x0000001f.  Measured on
+               * V895 (two boots of the same binary, complementary RX/TX).
+               * Flip the role once and re-lock -- [V858] heal is the only move
+               * that changes the bit phase, and nothing on the ai_vox capture
+               * path was calling it (only voice_channel.c did).  Pure insert:
+               * the verdict does not alter the samples, it only reports and
+               * flips once on the first buffers of a capture start. */
+              {
+                static unsigned s_v899_bufs;
+                static unsigned s_v899_or;
+                static int s_v899_healed;
+                size_t v899j;
+              
+                /* [V914] This loop used to fold single BYTES
+                 * (s_v899_or |= (unsigned)vp[v899j]), so the
+                 * accumulator was capped at 0xff and the verdict
+                 * below -- s_v899_or < 0xf000u -- was true on every
+                 * boot whatever the microphone was doing.  Three V913
+                 * runs printed or=0x000000ff, which is the cap, not a
+                 * measurement.  Every boot therefore fired
+                 * esp32s3_i2s_v858_heal() on the 8th application
+                 * buffer, and heal() relocks, and a relock is a
+                 * stop/start that redraws the RX bit phase.
+                 *
+                 * Fold the little-endian 16-bit words the [V380] /
+                 * [V729] loop above uses, so this matches the
+                 * driver's [V909] bor.  Bound `v899j + 1 < n` keeps
+                 * vp[v899j + 1] in range and drops a trailing odd
+                 * byte, which is what the [V380] loop does too. */
+
+                for (v899j = 0; v899j + 1 < n; v899j += 2)
+                  {
+                    s_v899_or |= (unsigned)vp[v899j]
+                                 | ((unsigned)vp[v899j + 1] << 8);
+                  }
+              
+                if (s_v899_bufs < 8u)
+                  {
+                    s_v899_bufs++;
+              
+                    if (s_v899_bufs == 8u)
+                      {
+                        s_v899_healed = (s_v899_or < 0xf000u);
+              
+                        if (s_v899_healed)
+                          {
+                            esp32s3_i2s_v858_heal();
+                          }
+              
+                        V1024P("[V899]] or=0x%08x verdict=%s heal=%d "
+                               "bufs=%u peak=%ld nz=%zu\n",
+                               s_v899_or,
+                               (s_v899_or < 0xf000u) ? "BAD" : "GOOD",
+                               s_v899_healed, s_v899_bufs, peak, nz);
+                      }
+                  }
+              }
+              /* [V718] This body was empty, so the app's view of a buffer
+               * was never compared with the driver's.  That comparison is
+               * the open question: [V709] post -- read straight out of
+               * bfcontainer->apb->samp -- shows audio, while the app's own
+               * chunk dump shows 7fff/8000 rails and maxpeak=32768.  The
+               * apb pointer below is what pairs the two views, because the
+               * driver prints its apb too. */
+
               if ((s_v380_buf % 4) == 1 && n >= 8)
                 {
-                  syslog(LOG_INFO, "[V380] ph=%d buf#%d n=%u nz=%u "
-                         "peak=%ld b=%02x%02x %02x%02x %02x%02x %02x%02x\n",
-                         s_v380_phase, s_v380_buf, (unsigned)n, (unsigned)nz,
-                         peak, vp[0], vp[1], vp[2], vp[3],
-                         vp[4], vp[5], vp[6], vp[7]);
+                  char v718h[160];
+                  int  v718p = 0;
+                  size_t v718j;
+
+                  for (v718j = 0; v718j < 8 && (v718j * 2 + 1) < n; v718j++)
+                    {
+                      unsigned v718u =
+                          (unsigned)vp[v718j * 2]
+                          | ((unsigned)vp[v718j * 2 + 1] << 8);
+
+                      v718p += snprintf(v718h + v718p,
+                                        sizeof(v718h) - (size_t)v718p,
+                                        "%04x ", v718u);
+                    }
+
+                  V1024S(LOG_INFO, "[V718]] app apb=%p off=%u n=%u peak=%ld nz=%u "
+                         "ac=%ld ms=%lu b=%s\n",
+                         (void *)apb, (unsigned)cap->pending_off,
+                         (unsigned)n, peak, (unsigned)nz,
+                         (long)(v729max - v729min),
+                         (unsigned long)(v729cnt
+                             ? (unsigned long)(v729sq / v729cnt)
+                             : 0UL),
+                         v718h);
                 }
             }
 
@@ -754,7 +1027,7 @@ int native_capture_read(struct native_cap_s* cap, void* buf, size_t len)
 void native_capture_selftest(void)
 {
 #if V401_CAPTURE_PROBE == 0
-    syslog(LOG_INFO, "[V401] capture probe parked "
+    V1024S(LOG_INFO, "[V401]] capture probe parked "
                      "(V401_CAPTURE_PROBE=0)\n");
     return;
 #else
@@ -764,19 +1037,19 @@ void native_capture_selftest(void)
     int i;
     int got = 0;
 
-    syslog(LOG_INFO, "[V380] selftest begin (phase=%d)\n", s_v380_phase);
+    
 
     rc = native_capture_open(&cap, "/dev/audio/pcm0c", 16000, 1, 16);
     if (rc != 0 || cap == NULL)
       {
-        syslog(LOG_ERR, "[V380] selftest open failed: %d\n", rc);
+        
         return;
       }
 
     rc = native_capture_start(cap);
     if (rc != 0)
       {
-        syslog(LOG_ERR, "[V380] selftest start failed: %d\n", rc);
+        
         native_capture_abort(cap);
         native_capture_close(cap);
         return;
@@ -801,12 +1074,12 @@ void native_capture_selftest(void)
           }
         else
           {
-            syslog(LOG_INFO, "[V380] selftest read rc=%d\n", n);
+            
             break;
           }
       }
 
-    syslog(LOG_INFO, "[V380] selftest end: %d bytes in %d reads\n", got, i);
+    
 
     native_capture_abort(cap);
     native_capture_close(cap);
@@ -834,8 +1107,7 @@ int native_capture_abort(struct native_cap_s* cap)
     if (s_v380_phase == 1)
       {
         s_v380_phase = 2;
-        syslog(LOG_INFO, "[V380] phase 2: loopback OFF, TX master kept, "
-               "real codec from now on\n");
+        
       }
 
     if (cap->started) {
@@ -843,17 +1115,111 @@ int native_capture_abort(struct native_cap_s* cap)
         ioctl(cap->fd, AUDIOIOC_STOP, 0);
     }
 
+    V1024S(LOG_INFO, "[V750]] abort: stopped, flushing\n");
+
+    /* [V697] Hand back whatever the RX DMA still owns BEFORE the buffers are
+     * freed.  Without this the driver kept a container pointing at an apb
+     * this function is about to release, and the next DMA completion wrote
+     * into freed memory -- the heap corruption that took the board down
+     * (mm_malloc, EXCCAUSE=001d, vaddr=0x8) and left the screen on
+     * "正在聆听". */
+
+    esp32s3_i2s_rx_flush();
+
     cap->stopped = 1;
 
-    /* Drain completion messages so nothing stays queued on the mq. */
+    /* [V750] Drain completion messages -- WITH A BOUND.
+     *
+     * 原来的 while (native_mq_receive_timed(cap->mq, &msg, 1) > 0) 没有上界：
+     * 只要驱动还在往 mq 里投递消息（RX DMA 没真正停下来、V380 环回仍在喂
+     * 数、或队列里压着大量非 DEQUEUE 消息），它就一轮接一轮永不退出 ——
+     * 每条消息都是"立刻返回"，所以连那个 1 秒超时也帮不上忙。
+     *
+     * 实测后果（v749 8 分钟回归，t=76.6）：voice_channel_stop() 卡在这个
+     * 循环里 400 s，state 永远停在 VOICE_STOPPING，命令工作线程随之永久
+     * 卡死，s_ptt_hold 再也解不开，按 BOOT 完全没有反应。
+     *
+     * 加双重上界：最多 64 条消息、整体不超过 2000 ms。超了就放弃剩下的
+     * （泄漏几个 apb 远比整机僵死好）。 */
 
-    while (native_mq_receive_timed(cap->mq, &msg, 1) > 0) {
-        if (msg.msg_id == AUDIO_MSG_DEQUEUE && msg.u.ptr &&
-            cap->outstanding > 0) {
-            cap->outstanding--;
-            cap->freeq[cap->nfree++] = (struct ap_buffer_s*)msg.u.ptr;
+    V1024S(LOG_INFO, "[V750]] abort: drain start mq=%d outstanding=%d\n",
+           cap->mq, cap->outstanding);
+
+    {
+        /* [V984] *** Do not pay a 1 s timeout for a queue that is empty. ***
+         *
+         * native_mq_receive_timed() takes SECONDS and the loop below calls it
+         * with 1, so on the normal path -- esp32s3_i2s_rx_flush() has already
+         * handed the DMA buffers back, outstanding is stale at 1 and no
+         * completion message will ever arrive -- the first receive waits the
+         * full second, times out, and only then breaks.  Measured: abort
+         * drain start 111.22 -> abort done 112.22, exactly 1.00 s, 123 times
+         * in one 508 s session, i.e. ~24 % of the time with capture stopped.
+         *
+         * So look first: mq_curmsgs is how many messages are actually queued.
+         * The loop below then stops before issuing a receive it does not
+         * expect to succeed, which makes an empty drain cost nothing.
+         * -1 means mq_getattr failed: fall back to the old behaviour. */
+        int          v984_pending = -1;
+        struct mq_attr v984_attr;
+
+        if (mq_getattr(cap->mq, &v984_attr) == OK)
+          {
+            v984_pending = (int)v984_attr.mq_curmsgs;
+          }
+
+        int   drained = 0;
+        clock_t t0 = clock_systime_ticks();
+
+        while (drained < 512 &&   /* [V886] was 64 */
+               (long)((clock_systime_ticks() - t0) * 10) < 6000L)  /* [V886] 2000 */
+          {
+            /* [V984] Everything that was queued has been drained: stop before
+             * the blocking receive, which would otherwise sit out its full
+             * 1 s timeout and return nothing. */
+            if (v984_pending >= 0 && drained >= v984_pending)
+              {
+                break;
+              }
+
+            if (native_mq_receive_timed(cap->mq, &msg, 1) <= 0)
+              {
+                break;
+              }
+
+            if (msg.msg_id == AUDIO_MSG_DEQUEUE && msg.u.ptr &&
+                cap->outstanding > 0)
+              {
+                cap->outstanding--;
+                cap_v698_push(cap, (struct ap_buffer_s*)msg.u.ptr);
+              }
+
+            drained++;
+          }
+
+        /* [V984] Proof for the next capture: pending is what we saw queued,
+         * drained is what we actually took.  Both 0 means the 1 s wait is
+         * gone; pending>0 drained<pending means messages were still in
+         * flight and we abandoned them (the trade V750 already accepts). */
+        {
+          static unsigned s_v984_n;
+
+          V1024S(LOG_INFO, "[V984]] drain #%u pending=%d drained=%d out=%d\n",
+                 ++s_v984_n, v984_pending, drained, cap->outstanding);
         }
+
+        if (drained >= 512 ||   /* [V886] was 64 */
+            (long)((clock_systime_ticks() - t0) * 10) >= 6000L) /* [V886] 2000 */
+          {
+            V1024S(LOG_ERR, "[V750]] abort: drain hit bound (%d msgs, %ld ms) -- "
+                   "%d buffer(s) abandoned\n",
+                   drained,
+                   (long)((clock_systime_ticks() - t0) * 10),
+                   cap->outstanding);
+          }
     }
+
+    V1024S(LOG_INFO, "[V750]] abort: done\n");
 
     return 0;
 }
@@ -870,22 +1236,96 @@ void native_capture_close(struct native_cap_s* cap)
     /* Stop the stream so in-flight buffers come back before we free
      * them, then drain the completion queue. */
 
+    V1024S(LOG_INFO, "[V750]] close: enter fd=%d started=%d out=%d\n",
+           cap->fd, (int)cap->started, cap->outstanding);
+
     if (cap->fd >= 0 && (cap->started || cap->outstanding > 0)) {
         cap->started = 0;
         ioctl(cap->fd, AUDIOIOC_STOP, 0);
     }
 
+    /* [V697] See native_capture_abort().  close() can be reached without
+     * abort() (open() failure paths), so flush here as well. */
+
+    esp32s3_i2s_rx_flush();
+
     cap->stopped = 1;
 
     if (cap->mq >= 0) {
-        while (native_mq_receive_timed(cap->mq, &msg, 1) > 0) {
+        /* [V750] 同 native_capture_abort()：排空必须有上界，否则 DMA 一直
+         * 投递消息时这里就是无期徒刑。 */
+
+        /* [V984] *** Do not pay a 1 s timeout for a queue that is empty. ***
+         *
+         * native_mq_receive_timed() takes SECONDS and the loop below calls it
+         * with 1, so on the normal path -- esp32s3_i2s_rx_flush() has already
+         * handed the DMA buffers back, outstanding is stale at 1 and no
+         * completion message will ever arrive -- the first receive waits the
+         * full second, times out, and only then breaks.  Measured: abort
+         * drain start 111.22 -> abort done 112.22, exactly 1.00 s, 123 times
+         * in one 508 s session, i.e. ~24 % of the time with capture stopped.
+         *
+         * So look first: mq_curmsgs is how many messages are actually queued.
+         * The loop below then stops before issuing a receive it does not
+         * expect to succeed, which makes an empty drain cost nothing.
+         * -1 means mq_getattr failed: fall back to the old behaviour. */
+        int          v984_pending = -1;
+        struct mq_attr v984_attr;
+
+        if (mq_getattr(cap->mq, &v984_attr) == OK)
+          {
+            v984_pending = (int)v984_attr.mq_curmsgs;
+          }
+
+        int   drained = 0;
+        clock_t t0 = clock_systime_ticks();
+
+        while (drained < 512 &&   /* [V886] was 64 */
+               (long)((clock_systime_ticks() - t0) * 10) < 6000L)  /* [V886] 2000 */
+          {
+            /* [V984] Everything that was queued has been drained: stop before
+             * the blocking receive, which would otherwise sit out its full
+             * 1 s timeout and return nothing. */
+            if (v984_pending >= 0 && drained >= v984_pending)
+              {
+                break;
+              }
+
+            if (native_mq_receive_timed(cap->mq, &msg, 1) <= 0)
+              {
+                break;
+              }
+
             if (msg.msg_id == AUDIO_MSG_DEQUEUE && msg.u.ptr &&
-                cap->outstanding > 0) {
+                cap->outstanding > 0)
+              {
                 cap->outstanding--;
-                cap->freeq[cap->nfree++] =
-                    (struct ap_buffer_s*)msg.u.ptr;
-            }
+                cap_v698_push(cap, (struct ap_buffer_s*)msg.u.ptr);
+              }
+
+            drained++;
+          }
+
+        /* [V984] Proof for the next capture: pending is what we saw queued,
+         * drained is what we actually took.  Both 0 means the 1 s wait is
+         * gone; pending>0 drained<pending means messages were still in
+         * flight and we abandoned them (the trade V750 already accepts). */
+        {
+          static unsigned s_v984_n;
+
+          V1024S(LOG_INFO, "[V984]] drain #%u pending=%d drained=%d out=%d\n",
+                 ++s_v984_n, v984_pending, drained, cap->outstanding);
         }
+
+        if (drained >= 512 ||   /* [V886] was 64 */
+            (long)((clock_systime_ticks() - t0) * 10) >= 6000L) /* [V886] 2000 */
+          {
+            V1024S(LOG_ERR, "[V750]] close: drain hit bound (%d msgs, %ld ms) -- "
+                   "%d buffer(s) abandoned\n",
+                   drained,
+                   (long)((clock_systime_ticks() - t0) * 10),
+                   cap->outstanding);
+          }
 
         ioctl(cap->fd, AUDIOIOC_UNREGISTERMQ, (unsigned long)cap->mq);
         mq_close(cap->mq);
@@ -896,9 +1336,28 @@ void native_capture_close(struct native_cap_s* cap)
     if (cap->fd >= 0) {
         ioctl(cap->fd, AUDIOIOC_RELEASE, 0);
 
+        /* [V886] NEVER free a buffer the driver may still be DMA-ing into.
+         *
+         * The drain above is bounded, so it can and does finish with
+         * cap->outstanding > 0 ("N buffer(s) abandoned").  Freeing the
+         * apbs anyway hands their memory back to the heap while the I2S
+         * RX descriptor still points at it -- a use-after-free whose
+         * symptom is exactly what we see: an InstructionFetchErrorCause
+         * (EXCCAUSE 2) in the es8311 worker a few seconds after a
+         * capture starts, at a PC that is not a code address.
+         *
+         * v733 already established the rule for the sibling path: when
+         * the owner has not let go, LEAK rather than free.  A leaked
+         * buffer costs bytes; a freed one costs the board. */
         if (cap->apbs) {
-            for (i = 0; i < cap->nbuffers; i++) {
-                native_free_buffer(cap->fd, cap->apbs[i]);
+            if (cap->outstanding == 0) {
+                for (i = 0; i < cap->nbuffers; i++) {
+                    native_free_buffer(cap->fd, cap->apbs[i]);
+                }
+            } else {
+                V1024S(LOG_ERR, "[V886]] close: %d buffer(s) still outstanding, "
+                       "leaking them on purpose (freeing would be a UAF)\n",
+                       cap->outstanding);
             }
         }
 
