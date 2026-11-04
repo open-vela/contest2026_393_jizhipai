@@ -85,8 +85,27 @@ repo init -u https://github.com/open-vela/contest2026_393_jizhipai \
 repo sync -c -j8
 ```
 
-### 2. 编译
+### 2. 覆盖公共仓补丁（重要）
 
+`repo sync` 只会把板级目录映射进工程树：
+
+```
+vendor/openvela/boards/contest2026_393_esp32s3_eye  ←  ai_vox3/nuttx/boards/xtensa/esp32s3/esp32s3-eye
+```
+
+本作品对 **nuttx 内核**（I2S 全双工时钟、GDMA 完成队列、IOB 池、ES8311、ST7789、WiFi adapter…）
+和 **apps**（netinit / wapi）的修复属于公共仓改动，按大赛规定需 fork + PR 由组委会 review，
+不能直接写进 manifest 映射。这些改动在本仓以快照形式提供，编译前必须覆盖：
+
+```bash
+# 在 openvela 工作区根目录（与 nuttx/ apps/ packages/ 同级）
+bash contest2026_393_jizhipai/ai_vox3/apply_overlay.sh
+```
+
+脚本会把 `ai_vox3/{nuttx,apps,packages_ai_agent}` 覆盖到 `nuttx/`、`apps/`、`packages/ai_agent/`。
+**跳过这一步，编出来的固件不含语音链路修复**（表现为能连网、能显示，但按 BOOT 录音无效）。
+
+### 3. 编译
 在 openvela 工作区根目录（本仓的上一级）：
 
 ```bash
@@ -95,7 +114,7 @@ repo sync -c -j8
 
 产物：`nuttx/nuttx.bin`
 
-### 3. 烧录
+### 4. 烧录
 
 按住 **BOOT（GPIO0）** 上电进入下载模式：
 
@@ -114,7 +133,7 @@ python -m esptool --chip esp32s3 --port <COM> -b 460800 \
 
 > 只写 `0x0`。**不要动 `0x9000`**（NVS 分区，存有 WiFi 凭据等）。
 
-### 4. 运行
+### 5. 运行
 
 - 上电约 35 s 后自播开机问候语「桌面小跟班语音就绪」。
 - 按 **BOOT** 开始说话（松手或 8 s 自动结束录音）→ ASR → LLM → TTS 回播。
@@ -123,7 +142,7 @@ python -m esptool --chip esp32s3 --port <COM> -b 460800 \
 - 也可以直接说「下一页」，由自定义工具 `ui_control` 下发 `next` / `prev` / `home`。
 - 语音字幕在所有页面底部常驻。
 
-### 5. 硬件接线（GPIO）
+### 6. 硬件接线（GPIO）
 
 | 功能 | 引脚 |
 | --- | --- |
@@ -144,7 +163,7 @@ python -m esptool --chip esp32s3 --port <COM> -b 460800 \
 （cx/cy/w/h 为千分比 0..1000，conf 为 0..100 置信度），无人脸时发 `N\n`。
 K230 的 USB 是复合设备，其中 `MI_02` 为 MTP，可在「此电脑」直接访问其 SD 卡。
 
-### 6. 服务端端点
+### 7. 服务端端点
 
 语音与对话走云端，端点在编译期 seed 中（`esp32s3_bringup.c`、`http_tts.c`、`http_asr.c`）：
 

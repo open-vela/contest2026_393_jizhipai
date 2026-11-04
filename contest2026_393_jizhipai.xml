@@ -19,7 +19,13 @@
     <linkfile src="ai_vox3/app/my_ai_tool" dest="packages/demos/contest2026_393_my_ai_tool"/>
     <linkfile src="ai_vox3/app/day2_ui" dest="packages/demos/contest2026_393_day2_ui"/>
     <linkfile src="ai_vox3/app/xiaozhi_ui" dest="packages/demos/contest2026_393_xiaozhi_ui"/>
-    <linkfile src="ai_vox3/packages_ai_agent" dest="packages/ai_agent"/>
+    <!--
+      ai_agent 无法用 <linkfile> 覆盖：openvela.xml 里 packages/ai_agent 本身就是一个
+      project（name=packages_ai_agent），sync 时该目录已被 git 检出，repo 的
+      removedirs() 删不掉非空目录，只会打印 "Cannot symlink" 并跳过。
+      因此 ai_vox3/packages_ai_agent 改为编译前用 ai_vox3/apply_overlay.sh 覆盖，
+      与 nuttx / apps 的公共仓补丁走同一条路径。
+    -->
     <linkfile src="ai_vox3/nuttx/boards/xtensa/esp32s3/esp32s3-eye" dest="vendor/openvela/boards/contest2026_393_esp32s3_eye"/>
   </project>
 </manifest>
