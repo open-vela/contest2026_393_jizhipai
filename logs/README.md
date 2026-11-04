@@ -46,3 +46,15 @@ logs/
 - `V1041` / `V1042`：双轴舵机引脚逆向确认（PAN=GPIO2/LEDC CH0，TILT=GPIO1/LEDC CH1）
 - `V1043` / `V1044`：云台控制律两轮调参（先提速到 20° 阶跃约 500 ms，再增大幅度到 pan 72° / tilt 99°）
 - K230 定位推理链：MTP 挂载读 SD 卡取 `VOX3_IP` → ARP 观察确认在线 → 下发静态 IP 稳定链路
+
+## 格式归一化说明（2026-11-04）
+
+`logs/uhh27/` 下的会话文件来自早期导出（键名为 `timestamp`，缺少 `schema_version` /
+`team_id` / `github_login` / `tool` 等头部字段）。为通过官方 `validate-log.py`，
+对这些文件做了**仅补字段**的归一化：
+
+- 补齐 `schema_version=1.0` / `session_id` / `team_id` / `github_login` / `tool`
+- `timestamp` 键名改为 `ts`，时间值补 `Z`
+- **`seq`、`ts`、`role`、`text` 的内容一字未改**，未删除、未合并、未跳号
+
+校验结果：`Files checked: 9 / Events checked: 6464 / ✅ ALL OK`
