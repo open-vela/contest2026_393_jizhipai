@@ -31,11 +31,6 @@
 #include <assert.h>
 #include <debug.h>
 
-/* ROM console TX: used only for the USB-Serial-JTAG boot kick below.
- * Plain prototype is enough (ROM symbol, not on the sched/ include path).
- */
-int esp_rom_printf(const char *fmt, ...);
-
 #include <nuttx/arch.h>
 #include <nuttx/board.h>
 #include <nuttx/compiler.h>
@@ -770,6 +765,7 @@ void nx_start(void)
   g_nx_initstate = OSINIT_BOOT;
   sched_trace_begin();
   sinfo("Entry\n");
+  ets_printf("[CHK] nx-enter\n");
 
   /* Head of ready-to-run/assigned task lists valid */
 
@@ -778,22 +774,12 @@ void nx_start(void)
   /* The memory manager has been initialized */
 
   memory_initialize();
+  ets_printf("[CHK] nx-mem\n");
 
   /* MCU-specific hardware is initialized */
 
-  /* [V576] USB-Serial-JTAG console kick.
-   *
-   * On the AI-VOX3 board the ROM console is USB-Serial-JTAG, and this port
-   * registers its own serial driver inside hardware_initialize()->up_initialize()
-   * ->xtensa_serialinit().  Observed on hardware: unless the ROM console is
-   * written to once immediately before that registration and once right after,
-   * the boot stalls silently inside hardware_initialize() (no output at all,
-   * board otherwise fine).  Two no-op ROM writes are sufficient and cost
-   * nothing at runtime.
-   */
-  
   hardware_initialize();
-  esp_rom_printf(".\n");
+  ets_printf("[CHK] nx-hw\n");
 
   /* Setup for Multi-Tasking ************************************************/
 
@@ -809,6 +795,7 @@ void nx_start(void)
    */
 
   DEBUGVERIFY(group_setupidlefiles());
+  ets_printf("[CHK] nx-files\n");
 
 #ifdef CONFIG_SMP
   for (i = 1; i < CONFIG_SMP_NCPUS; i++)
@@ -840,6 +827,7 @@ void nx_start(void)
 
   /* Create initial tasks and bring-up the system */
 
+  ets_printf("[CHK] nx-pre-bringup\n");
   nx_bringup();
 
   /* Enter to idleloop */

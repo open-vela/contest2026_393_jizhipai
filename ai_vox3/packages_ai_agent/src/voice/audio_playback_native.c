@@ -444,6 +444,40 @@ int native_playback_write(native_pb_t* pb, const void* buf, size_t len)
         return -EINVAL;
     }
 
+    /* [BOOT-HAL-MUTE-2 2026-10-27] 本地链路也执行同一道开机硬闸。
+     *
+     * aivox 走 AudioOutputDevice::Write()，本地固定回复（台灯/传感器）走这里，
+     * 两条路分开，只堵一条等于漏一条。开机窗口内非全零缓冲直接丢；
+     * 全零缓冲照常放行——采集期的 clock-keeper 靠它驱动 I2S TX 时钟，
+     * 且零样本本来就不会出声。 */
+    {
+        extern int64_t g_vox_audio_mute_until_ms;   /* 定义在 ai_vox_main.cpp（extern "C"） */
+        if (g_vox_audio_mute_until_ms != 0) {
+            struct timespec bts;
+            int64_t now_ms;
+            clock_gettime(CLOCK_MONOTONIC, &bts);
+            now_ms = (int64_t)bts.tv_sec * 1000LL + (int64_t)(bts.tv_nsec / 1000000L);
+            if (now_ms < g_vox_audio_mute_until_ms) {
+                const int16_t* s = (const int16_t*)buf;
+                size_t n = len / sizeof(int16_t);
+                size_t k;
+                int nonzero = 0;
+                for (k = 0; k < n; k++) {
+                    if (s[k] != 0) { nonzero = 1; break; }
+                }
+                if (nonzero) {
+                    static int bhm2_once = 0;
+                    if (bhm2_once++ < 4) {
+                        syslog(LOG_WARNING,
+                            "[BOOT-HAL-MUTE] drop local %u bytes (boot window)\n",
+                            (unsigned)len);
+                    }
+                    return (int)len;    /* 已消化，不让上层重试 */
+                }
+            }
+        }
+    }
+
     if (pb->stopped) {
         return -ECANCELED;
     }

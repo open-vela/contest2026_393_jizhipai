@@ -17,6 +17,7 @@
 extern int diag_report(const char *msg);
 #include <stdio.h>
 #include <stdlib.h>
+#include <syslog.h>      /* [V557] LOG_ERR for the boot beacon */
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -40,9 +41,15 @@ extern int diag_report(const char *msg);
 #define NET_MAX_AGE       30     /* seconds: state file older -> NO NET */
 #define EMO_PATH          "/tmp/emotion.txt"   /* [V315] voice state badge */
 
-#define COLOR_BG   0xFFE7       /* dark navy background (RGB565) */
-#define COLOR_FG   0x0000       /* clock - white */
-#define COLOR_SUB  0x3186       /* weather line - light blue-grey */
+#define COLOR_BG   0x001F       /* [V557] BRIGHT BLUE test background: if the
+                                 * panel goes bright blue after the self-test,
+                                 * info_screen's /dev/fb0 path works and the
+                                 * earlier "black screen" was only dark text
+                                 * on a dark background.  Was 0xFFE7 (a very
+                                 * light grey that INVON turns near-black). */
+#define COLOR_FG   0xFFFF       /* [V557] white text on the blue test bg.
+                                 * Was 0x0000 (black). */
+#define COLOR_SUB  0xFFE0       /* [V557] bright yellow, clearly visible */
 #define COLOR_LISTEN  0xF800    /* [V315] listening - red */
 #define COLOR_THINK   0xFD20    /* [V315] thinking - orange */
 #define COLOR_SPEAK   0x07E0    /* [V315] speaking - green */
@@ -503,11 +510,30 @@ int main(int argc, FAR char *argv[])
 
   printf("=== Info Screen (Team 307) ===\n");
 
+  /* [V553] Hold off for 20 s so the board-level LCD self-test in
+   * esp32s3_board_lcd.c (2 rounds x 4 colours x 2 s = 16 s) can paint its
+   * R/G/B/W sweep on a clean panel.  Before this delay both tasks drove
+   * /dev/fb0 at the same time: the self-test repainted a solid colour every
+   * 3 s while this loop cleared the panel to black once a second, so the
+   * user saw exactly what they described -- "亮了一下又灭了" (a colour
+   * flashes, then the screen goes dark again).  Neither writer is wrong;
+   * they just must not run concurrently. */
+
+  sleep(20);
+
   if (fb_init() < 0)
     {
       printf("ERROR: framebuffer init failed\n");
+      syslog(LOG_ERR, "[IS_V557] fb_init FAILED\n");
       return 1;
     }
+
+  /* [V557] Beacon so the boot capture can prove fb_init() succeeded and the
+   * panel task is about to paint.  info_screen used to send these over HTTP
+   * (diag_report) which is invisible when the network is down -- which is
+   * exactly when we need them. */
+  syslog(LOG_ERR, "[IS_V557] fb_init OK %dx%d stride=%d -> painting BLUE\n",
+         (int)g_xres, (int)g_yres, (int)g_stride);
 
   time_t  last_w  = 0;
   char    wtext[32];

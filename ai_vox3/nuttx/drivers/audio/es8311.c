@@ -1250,6 +1250,30 @@ static int es8311_configure(FAR struct audio_lowerhalf_s *dev,
             /* Set the mic gain */
 
             uint32_t mic_gain = caps->ac_controls.hw[0];
+
+            /* [V1234] *** the client silently zeroes the mic ***
+             *
+             * native_capture_open() hands us an audio_caps_s whose
+             * ac_controls.hw[0] is 0 for the input feature unit, so every
+             * capture session ended by writing REG16 SCALE = 0, i.e. 0 dB.
+             * The v730 sweep measured exactly that point:
+             *
+             *   0x16 SCALE 0 -> ac 250   (this is what we measure now:
+             *                              mn=-64 mx=63, peak 127)
+             *   0x16 SCALE 6 -> ac 1448
+             *   0x16 SCALE 7 -> ac 1985
+             *
+             * 42 dB clipped on speech (v979), 36 dB did not.  Treat any
+             * request below 30 dB as "client did not mean it" and hold the
+             * front end at 36 dB instead of dropping the mic 36 dB below
+             * where it belongs.
+             */
+
+            if (mic_gain < 30)
+              {
+                mic_gain = 36;
+              }
+
             audinfo("    Mic gain: %" PRIu32 "\n", mic_gain);
 
             es8311_setmicgain(priv, mic_gain);
@@ -1596,6 +1620,54 @@ static int es8311_configure(FAR struct audio_lowerhalf_s *dev,
               }
 
             V1024S(LOG_ERR, "[V682]] es8311 00..1f: %s\n", v682b);
+
+          /* [V1236] Straight-to-console snapshot of the whole analogue and
+           * serial-port configuration.  [V682] goes through syslog, whose
+           * channel interleaves with six other threads on this board, so its
+           * multi-hundred-byte lines never survive intact; printf with the
+           * console lock held does.
+           */
+          {
+            char v1236b[320];
+            int  v1236p = 0;
+            int  v1236i;
+
+            v1236p += snprintf(v1236b + v1236p,
+                               sizeof(v1236b) - (size_t)v1236p,
+                               "[V1236] mode=%d rate=%lu mclk=%lu gain=%d:",
+                               (int)priv->audio_mode,
+                               (unsigned long)priv->samprate,
+                               (unsigned long)priv->mclk,
+                               (int)priv->mic_gain);
+
+            for (v1236i = 0x00; v1236i <= 0x2f &&
+                 v1236p < 280; v1236i++)
+              {
+                if ((v1236i % 8) == 0 && v1236i != 0)
+                  {
+                    v1236p += snprintf(v1236b + v1236p,
+                                       sizeof(v1236b) - (size_t)v1236p,
+                                       "\n[V1236] %02x:", v1236i);
+                  }
+
+                v1236p += snprintf(v1236b + v1236p,
+                                   sizeof(v1236b) - (size_t)v1236p,
+                                   " %02x",
+                                   (unsigned)(es8311_readreg(priv,
+                                              (uint8_t)v1236i) & 0xff));
+              }
+
+            v1236p += snprintf(v1236b + v1236p,
+                               sizeof(v1236b) - (size_t)v1236p,
+                               " | 31=%02x 32=%02x 37=%02x 44=%02x 45=%02x",
+                               (unsigned)(es8311_readreg(priv, 0x31) & 0xff),
+                               (unsigned)(es8311_readreg(priv, 0x32) & 0xff),
+                               (unsigned)(es8311_readreg(priv, 0x37) & 0xff),
+                               (unsigned)(es8311_readreg(priv, 0x44) & 0xff),
+                               (unsigned)(es8311_readreg(priv, 0x45) & 0xff));
+
+            printf("%s\n", v1236b);
+          }
 
             V1024S(LOG_ERR, "[V682]] es8311 31=%02x 32=%02x 37=%02x 44=%02x 45=%02x "
                    "mclk=%lu rate=%lu bps=%d gain=%d mode=%d\n",

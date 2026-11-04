@@ -6406,6 +6406,34 @@ int esp_wifi_sta_connect(void)
 
   syslog(LOG_ERR, "[DIAG] sta_connect enter\n");
   g_sta_reconnect = true;
+
+  /* [V1259] Country CN so the association scan covers ch 12-13.
+   *
+   * The blob boots with country "01" (world, ch 1-11 only).
+   * Chinese APs commonly sit on ch 12/13 - invisible to that scan
+   * set, so every netinit association dies with NO_AP_FOUND
+   * (reason 201) even at strong RSSI.  The manual wapi path
+   * ("wapi country wlan0 CN") uses exactly the struct below and
+   * associates fine on this AP (measured: DHCP lease obtained),
+   * so apply the same country here - netinit and the set_wifi
+   * fallback then both see ch 12/13 networks. */
+  {
+    static bool s_country_cn_done;
+    if (!s_country_cn_done)
+      {
+        wifi_country_t cn;
+        memset(&cn, 0, sizeof(cn));
+        memcpy(cn.cc, "CN", 2);
+        cn.schan = 1;
+        cn.nchan = 13;
+        if (esp_wifi_set_country(&cn) == 0)
+          {
+            syslog(LOG_INFO,
+                   "[V1259] country=CN ch1-13 (was world ch1-11)\n");
+          }
+        s_country_cn_done = true;
+      }
+  }
   /* [V107] Force the deployment AP credentials.
    *
    * The Espressif Wi-Fi blob keeps a station config in its on-flash NVS
@@ -6465,30 +6493,18 @@ int esp_wifi_sta_connect(void)
      * netinit_associate() walks g_ssid_candidates[] and writes each candidate
      * into g_sta_wifi_cfg before calling us.  The unconditional overwrite
      * below made that list purely decorative: with the phone hotspot switched
-     * off, every attempt was forced back to "31246", which was no longer in
+     * off, every attempt was forced back to "3124", which was no longer in
      * the scan result at all, so the log filled with reason 201
      * (NO_AP_FOUND) while the campus AP on channel 1 sat right there in the
      * boot scan.  Only "vox3"/"8888" - the neighbours the early R-builds used
      * to lock onto - are still treated as unusable. */
 
-    {
-      static char keep[33];
-      const char *s_in = (const char *)g_sta_wifi_cfg.sta.ssid;
-
-      if (s_in[0] != 0 && strcmp(s_in, "vox3") != 0 &&
-          strcmp(s_in, "8888") != 0)
-        {
-          strncpy(keep, s_in, sizeof(keep) - 1);
-          keep[sizeof(keep) - 1] = 0;
-          s = keep;
-          
-        }
-      else
-        {
-          
-        }
-    }
-
+    /* [V1262] The Wi-Fi blob keeps a station config in its own NVS
+     * and reloads it on every boot; it still carried ssid=31246
+     * from older firmware and (via the old "keep" block) beat both
+     * config.json and the compiled default, so the radio kept
+     * joining the wrong AP.  Ignore that residue: the SSID is now
+     * config.json (written by set_wifi) or the compiled default. */
     memset(g_sta_wifi_cfg.sta.ssid, 0, 32);
     memcpy(g_sta_wifi_cfg.sta.ssid, s, strlen(s));
     memset(g_sta_wifi_cfg.sta.password, 0, 64);
@@ -6578,7 +6594,7 @@ int esp_wifi_sta_connect(void)
   g_sta_wifi_cfg.sta.sort_method        = WIFI_CONNECT_AP_BY_SIGNAL;
   g_sta_wifi_cfg.sta.listen_interval    = 0;
   g_sta_wifi_cfg.sta.sae_pwe_h2e        = WPA3_SAE_PWE_UNSPECIFIED;
-  /* [V607] Back to the PROVEN-WORKING v603 shape: MFPC=0/MFPR=0 + threshold=WIFI_AUTH_OPEN.  v603 measured LINKED + connected=1 + zero disconnects on 31246.  See the audit report for why 3124 still cannot be reached. */
+  /* [V607] Back to the PROVEN-WORKING v603 shape: MFPC=0/MFPR=0 + threshold=WIFI_AUTH_OPEN.  v603 measured LINKED + connected=1 + zero disconnects on 3124.  See the audit report for why 3124 still cannot be reached. */
   g_sta_wifi_cfg.sta.pmf_cfg.capable    = true;
   g_sta_wifi_cfg.sta.pmf_cfg.required   = false;
   /* [V101] Threshold off.  A factory-reset router usually advertises plain

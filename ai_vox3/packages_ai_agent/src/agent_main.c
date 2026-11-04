@@ -298,7 +298,15 @@ static void* network_watch_task(void* arg)
      * every time (reason=0), with it running it never does.  Just wait for
      * the link netinit brings up. */
 
-    /* network_wifi_reconnect(); */
+    /* [V1257] Re-enabled as the boot fallback.  network_wifi_reconnect()
+     * first waits up to 8 s for netinit's link and returns without
+     * touching the interface when one is already up, and it bails out
+     * harmlessly when config_store holds no saved credentials - so the
+     * R26 race (an unconditional second association fighting netinit) no
+     * longer applies.  The manual wapi path only fires when netinit
+     * failed to bring the link up on its own. */
+
+    network_wifi_reconnect();
 
     /* Publish the network state for the info page (/tmp is tmpfs). */
     {
@@ -1387,6 +1395,7 @@ static void* agent_time_keeper(void* arg)
  * Uses a no-op chunk callback so it never touches the (possibly broken) audio
  * path.  This is diagnostic only and can be removed once audio is confirmed. */
 #include "voice/http_tts.h"
+#include "sensor_chat.h"
 
 /* [V207] Boot probes must NOT synthesise speech.
  *
@@ -1686,6 +1695,7 @@ int ai_agent_main(int argc, char* argv[])
         BOOT_LOG_RC(&t0, "P3", "feishu_bot_init", rc);
 #endif
 
+        sensor_chat_init();   /* [SENSOR-CHAT] 对话控灯模块 */
         rc = run_init_to("llm_proxy_init", llm_proxy_init, 12000);
         BOOT_LOG_RC(&t0, "P3", "llm_proxy_init", rc);
 

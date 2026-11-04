@@ -1,0 +1,28 @@
+#
+# XiaoZhi-style LVGL UI - Contest 2026 team 307
+#
+
+config LVX_CONTEST2026_307_XIAOZHI_UI
+	bool "XiaoZhi-style LVGL UI on fb0"
+	default n
+	depends on GRAPHICS_LVGL
+	---help---
+		Port of the XiaoZhi assistant UI (top bar with network/mute/battery
+		icons, centre status text, chat content area) to openvela LVGL.
+		Renders through the NuttX LVGL fbdev backend on /dev/fb0.
+
+if LVX_CONTEST2026_307_XIAOZHI_UI
+
+config LVX_CONTEST2026_307_XIAOZHI_UI_PROGNAME
+	string "Program name"
+	default "xiaozhi_ui"
+
+config LVX_CONTEST2026_307_XIAOZHI_UI_PRIORITY
+	int "Task priority"
+	default 100
+
+config LVX_CONTEST2026_307_XIAOZHI_UI_STACKSIZE
+	int "Stack size"
+	default 16384
+
+endif

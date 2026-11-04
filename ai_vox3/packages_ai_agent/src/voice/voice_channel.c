@@ -36,6 +36,7 @@
 #include "servo.h"
 #include "voice/audio_capture.h"
 #include "voice/audio_playback.h"
+#include "voice/tts_offline_data.h"   /* [TTS-CACHE] 内置离线语音 */
 #include "voice/voice_asr.h"
 #include "voice/voice_tts.h"
 #include "voice/volc_asr.h"
@@ -578,6 +579,11 @@ static struct {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .speak_lock = PTHREAD_MUTEX_INITIALIZER,
 };
+
+/* [SPEAK-EPOCH 2026-10-29] 用户打断（BOOT 开始聆听 / V719 停止）时
+ * epoch++，所有还在排队的旧回答句子拿到锁后发现时代不符即自弃。 */
+static volatile unsigned s_speak_epoch   = 0;
+static volatile unsigned s_speak_waiters = 0;
 
 /* ── File-based helpers (kept for QEMU test commands) ──── */
 
@@ -2332,7 +2338,9 @@ static void toggle_chat_click(void)
         diag_report("V719_ABORT");
         pthread_mutex_lock(&s_voice.lock);
         s_voice.tts_abort = 1;
+        http_tts_abort_active();   /* [TTS-ABORT] 立刻关掉旧 TTS 的 socket，防连接泄漏 */
         pthread_mutex_unlock(&s_voice.lock);
+        s_speak_epoch++;           /* [SPEAK-EPOCH] 排队中的旧句一并作废 */
         return;
     }
 
@@ -2972,7 +2980,11 @@ static void* button_wake_task(void* arg)
     int btn_prev = 0;    /* [V660] previous *committed* state, not the raw level */
 
     /* [V690] volume key state (button_wake_task is the only writer) */
-    static int  s_vol = 40;      /* 0..100; codec default is 400/1000 */
+    /* [CALM-VOL 2026-10-27] 40 -> 70：本地播报走 es8311_ext_setvolume(s_vol*10)，
+     * 即 400/1000 = 40%；而云端播报在 audio_output_engine.cpp 里是 set_volume(70)
+     * = 70%。两条路音量差近 5 dB，用户听到的就是"一会儿大声一会儿小声"。
+     * 统一到 70（也是上游 xiaozhi 的默认值）。 */
+    static int  s_vol = 70;      /* 0..100; 70 = 700/1000，与云端一致 */
     static int  vol_up_prev = 0, vol_dn_prev = 0;
     static int  vol_up_deb = 0,  vol_dn_deb = 0;
     static long vol_up_t0 = 0,   vol_dn_t0 = 0;
@@ -3740,7 +3752,11 @@ static void* asr_and_dispatch(void* arg)
  *
  * Buffer the pieces and hand the driver 1.5 s at a time. */
 
-#define VOICE_TTS_FLUSH_BYTES (48u * 1024u)  /* 1.5 s at 16k/s16 */
+/* [DMA-FIT 2026-10-27] 48 KB 超过了 I2S 管道深度（AP_PIPE_MAX 8 x 4096 = 32 KB），
+ * 流式 TTS 走这批数据时 i2s_send 直接返回 -12(ENOMEM)，一句话只播出一半。
+ * 24 KB = 0.75 s，安全落在队列以内；相比原来每 2 KB 写一次，
+ * TX re-arm 次数仍少一个数量级。 */
+#define VOICE_TTS_FLUSH_BYTES (512u * 1024u)  /* [WHOLE-UTTER] 整句一次写，32 s 音频封顶 */
 
 static unsigned char *s_pb_buf;
 static size_t         s_pb_len;
@@ -3760,12 +3776,53 @@ static void tts_buf_reset(void)
 
 static void tts_buf_flush(audio_playback_t *pb)
 {
+  size_t off;
+
   if (pb == NULL || s_pb_len == 0u)
     {
       return;
     }
 
-  audio_playback_write(pb, s_pb_buf, s_pb_len);
+  /* [REALTIME-FEED 2026-10-27] 按实时速率分帧喂 I2S。
+   *
+   * 与 tts_offline_play() 里 [TTS-CACHE-FIX] 同一个道理，只是这条路径
+   * 一直没做：I2S 管线只保留 AP_PIPE_MAX(8) x 4096 B = 32 KB 在飞，
+   * 一次性 write 一整句（本地 2301 服务 0.8 s 就返回 142 KB）会把管线
+   * 撑爆，i2s_send 返回 -12(ENOMEM)，audio_playback_write 提前返回，
+   * 实测一句话只播出前 15-30 KB（[V710] pcm=15KB / 源 142KB）。
+   *
+   * 4096 B @ 16 kHz/s16 = 128 ms 音频，所以每帧喂完等 110 ms；
+   * 写失败再小步重试（<= 40 次 x 20 ms = 800 ms）。 */
+  for (off = 0u; off < s_pb_len; off += 4096u)
+    {
+      size_t n = s_pb_len - off;
+      int    tries = 0;
+
+      /* [SPEAK-EPOCH 2026-10-29] 被打断（BOOT 聆听 / V719）时直接丢弃
+       * 残句缓冲，不再把半截音频续播出来（"断断续续"碎片来源之二）。 */
+      if (s_voice.tts_abort)
+        {
+          syslog(LOG_WARNING,
+                 "[%s] flush aborted, drop %u B residual audio\n",
+                 TAG, (unsigned)(s_pb_len - off));
+          s_pb_len = 0u;
+          return;
+        }
+
+      if (n > 4096u)
+        {
+          n = 4096u;
+        }
+
+      while (audio_playback_write(pb, s_pb_buf + off, n) < 0 &&
+             tries++ < 40 && !s_voice.tts_abort)
+        {
+          usleep(20000);
+        }
+
+      usleep(110000);
+    }
+
   s_pb_len = 0u;
 }
 
@@ -3828,8 +3885,19 @@ static void tts_stream_cb(const unsigned char* pcm_data,
         }
         tts_buf_push(pb, pcm_data, pcm_len);
 
+        /* [WHOLE-UTTER 2026-10-27] 不再边收边播。
+         *
+         * 流式写入的速率远高于播放速率（本地 2301 服务 0.5 s 就吐完
+         * 142 KB，而播完要 4.4 s），I2S 驱动的在飞槽位被瞬间占满，
+         * i2s_send 返回 -12(ENOMEM)，audio_playback_write 提前返回 ->
+         * 一句话只播出前 20%（[V710] pcm=23KB / 源 142KB）。
+         *
+         * 离线缓存那条路径是整段一次性 write，实测 71 KB 完整播出
+         * （pcm=70KB），所以这里也改成"收完整句再播"。代价是首字晚
+         * 0.3-0.5 s，换来的是不丢字。 */
         if (s_pb_len >= VOICE_TTS_FLUSH_BYTES)
           {
+            /* 占位：阈值已放大到 512 KB，正常一句话不会走到这里 */
             tts_buf_flush(pb);
           }
     }
@@ -3857,6 +3925,23 @@ int voice_channel_init(void)
     s_voice.tts_abort = 0;
     s_voice.tts_pb = NULL;
     sem_init(&s_voice.rec_ready, 0, 0);
+
+    /* [FIX-LAMPTTS 2026-10-26] Register the MiMo TTS backend even though
+     * the voice channel itself stays disabled.  sensor_chat local replies
+     * (台灯/传感器) speak via voice_channel_speak -> voice_tts_speak_stream,
+     * which needs a registered backend or it returns -ENOSYS and the
+     * speaker stays silent (the lamp-announce bug: "streaming TTS failed
+     * (-38)").  TTS is HTTPS only and never touches the microphone, so
+     * this does not violate the [V872] single-mic-owner rule.  ASR stays
+     * unregistered on purpose. */
+    if (!s_backends_registered) {
+        extern int mimo_tts_register(void);
+        mimo_tts_register();
+        /* [LOCAL-TTS 2026-10-27] init 把 tts_http_url 从 config_store 读进 http_tts.c
+         * （板上没配就落到 kconfig 默认值 = 用户 PC 的 2301 端口）。 */
+        http_tts_init();
+        s_backends_registered = 1;
+    }
 
     /* [V872] *** aivox owns the microphone. ***
      *
@@ -4007,6 +4092,10 @@ int voice_channel_start(void)
 {
     vc_beacon("B7_VC_ENTER");
 
+    /* [SPEAK-EPOCH 2026-10-29] 开始新聆听 = 旧回答整体作废：当前句由
+     * 下面的 abort 逻辑掐掉，排队中的句子靠 epoch 不符自弃。 */
+    s_speak_epoch++;
+
     pthread_mutex_lock(&s_voice.lock);
     if (s_voice.state != VOICE_IDLE || s_voice.cap != NULL) {
         /* [V713] s_voice.cap is the authoritative "the capture device is
@@ -4028,6 +4117,7 @@ int voice_channel_start(void)
         syslog(LOG_INFO,
             "[%s] PTT: stopping active TTS to prevent echo\n", TAG);
         s_voice.tts_abort = 1;
+        http_tts_abort_active();   /* [TTS-ABORT] 立刻关掉旧 TTS 的 socket，防连接泄漏 */
         audio_playback_stop(s_voice.tts_pb);
 
         /* Release lock so the speak thread can finish closing the
@@ -5267,6 +5357,111 @@ ui_state:
     }
 }
 
+/* [SPK-AUDIT] 播报审计：每次本地播报（含被拦的）追加一行到 /data/spk_audit.txt。
+ * 目的：串口日志被 LCDDIAG 刷屏冲掉、开机早期永远抓不到，只能落盘后开机 cat。
+ * who = LOCAL / LOCAL-BLOCKED / LAMP 等；/data 挂不上时退到 /tmp。 */
+void spk_audit(const char *who, const char *text)
+{
+    if (who == NULL) {
+        who = "?";
+    }
+    if (text == NULL) {
+        text = "(null)";
+    }
+    int fd = open("/data/spk_audit.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0) {
+        fd = open("/tmp/spk_audit.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    }
+    if (fd < 0) {
+        return;
+    }
+    {   /* [SPK-AUDIT] 单调时钟秒数，便于与用户听到的时刻对齐 */
+        struct timespec ts_;
+        long mono_ = (clock_gettime(CLOCK_MONOTONIC, &ts_) == 0) ? (long)ts_.tv_sec : -1L;
+        printf("[@@AUD] %ld|%s|%s\n", mono_, who, text);
+    }
+    char aline[200];
+    long mono2_ = -1L;
+    {
+        struct timespec ts2_;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts2_) == 0) {
+            mono2_ = (long)ts2_.tv_sec;
+        }
+    }
+    int an = snprintf(aline, sizeof(aline), "%ld|%s|%s\n", mono2_, who, text);
+    if (an > (int)sizeof(aline) - 1) {
+        an = (int)sizeof(aline) - 1;
+    }
+    if (an > 0) {
+        ssize_t ignored = write(fd, aline, (size_t)an);
+        (void)ignored;
+    }
+    close(fd);
+}
+
+
+/* [TTS-CACHE 2026-10-27] 内置离线语音。
+ *
+ * 背景：本地回复（"好的，这就为您点亮台灯" 等）走 voice_channel_speak ->
+ * MiMo 云端 TTS。2026-10-27 该 key 返回 HTTP 429 "quota exhausted"，
+ * volc 后端又没有凭据，结果屏幕有字幕、喇叭一声不吭。
+ *
+ * 办法：把固定回复的 PCM 预先合成好烧进固件（Windows SAPI，16kHz/16bit/mono，
+ * 见 tts_offline_data.h），播报前先按文本精确匹配；命中就直接写播放设备，
+ * 不联网、不消耗额度，也不受断网影响。
+ *
+ * 返回 0 = 已用离线语音播完；-1 = 没有对应的离线片段，调用方走原网络路径。 */
+static int tts_offline_play(const char *text, audio_playback_t *pb)
+{
+  size_t i;
+
+  if (text == NULL || pb == NULL)
+    {
+      return -1;
+    }
+
+  for (i = 0; i < TTS_OFF_COUNT; i++)
+    {
+      const tts_off_entry_t *e = &g_tts_off[i];
+      size_t off;
+
+      if (strcmp(e->text, text) != 0)
+        {
+          continue;
+        }
+
+      syslog(LOG_WARNING, "[TTS-CACHE] offline clip hit: \"%s\" (%u B)\n",
+             e->text, (unsigned)e->len);
+
+      /* [TTS-CACHE-FIX] 必须按实时速率喂数据。
+       * 播放管线只保留 8 帧（8 x 4096B = 1 秒）在飞，一次性把 70 KB 全推
+       * 进去会把管线撑爆：实测 [audio_direct] i2s_send failed: -12（ENOMEM），
+       * 结果只有前几帧出声。4096 B @16 kHz/16 bit = 128 ms，所以每帧写完
+       * 等 120 ms；写失败再小步重试。 */
+      for (off = 0; off < e->len; off += 4096u)
+        {
+          size_t n = e->len - off;
+          int    tries = 0;
+
+          if (n > 4096u)
+            {
+              n = 4096u;
+            }
+
+          while (audio_playback_write(pb, e->pcm + off, n) < 0 && tries++ < 40)
+            {
+              usleep(20000);
+            }
+
+          usleep(120000);
+        }
+
+      return 0;
+    }
+
+  return -1;
+}
+
 int voice_channel_speak(const char* text)
 {
     if (!text || text[0] == '\0') {
@@ -5274,6 +5469,7 @@ int voice_channel_speak(const char* text)
     }
 
     vc_beacon("B7_SP_ENTER");
+    spk_audit("LOCAL", text);          /* [SPK-AUDIT] 谁让它说的、说了什么 */
     /* [V1027] Who is speaking, and what?  The board reports a
      * boot-time weather line played three times; this names the
      * caller of every synthesised line.  printf, not syslog:
@@ -5281,19 +5477,35 @@ int voice_channel_speak(const char* text)
      * the console. */
     printf("[V1027] speak: %.48s\n", text);
 
+    /* [SPEAK-EPOCH] 记录入队时代：排队期间被打断则自弃 */
+    unsigned my_epoch = s_speak_epoch;
+
     /* ── Serialize concurrent speak calls ── */
-    /* If another thread is already speaking, abort its TTS playback
-     * so we don't overlap media_player sessions (which causes the
-     * media framework to attempt a ~1.3GB allocation and crash). */
-    pthread_mutex_lock(&s_voice.lock);
-    if (s_voice.tts_pb) {
-        syslog(LOG_INFO, "[%s] speak: aborting previous TTS\n", TAG);
-        s_voice.tts_abort = 1;
-        audio_playback_stop(s_voice.tts_pb);
+    /* [SPEAK-QUEUE 2026-10-29] 旧逻辑在入场时掐掉上一句的播放——但云端
+     * 长回答的下一句文本总在上一句还在播时就到达（诗行播 5~19s，LLM
+     * 2~4s 就推下一句），回答于是自己打断自己成碎片（字幕全有、声音
+     * 残缺 = "断断续续"）。speak_lock 本就完整串行化媒体路径（防
+     * media_player 会话重叠的 1.3GB 分配崩溃），入场无需杀前一句。
+     * 真正的用户打断由 voice_channel_start()/V719 的 abort + epoch++ 处理。
+     * 等待数达上限则丢弃最陈旧尾句，防线程/DRAM 积压。 */
+    if (s_speak_waiters >= 10) {
+        syslog(LOG_WARNING,
+               "[%s] [SPEAK-QUEUE] %u pending, drop stale tail: %.32s\n",
+               TAG, s_speak_waiters, text);
+        return -EBUSY;
     }
-    pthread_mutex_unlock(&s_voice.lock);
+    s_speak_waiters++;
 
     pthread_mutex_lock(&s_voice.speak_lock);
+    s_speak_waiters--;
+
+    if (s_speak_epoch != my_epoch) {
+        pthread_mutex_unlock(&s_voice.speak_lock);
+        syslog(LOG_WARNING,
+               "[%s] [SPEAK-EPOCH] stale after interrupt, drop: %.32s\n",
+               TAG, text);
+        return -ECANCELED;
+    }
 
     /* ── [V67] Half-duplex hand-over instead of an instant -EBUSY ──
      *
@@ -5352,6 +5564,25 @@ int voice_channel_speak(const char* text)
         return 0;
     }
 
+    /* [NOWEATHER-TTS] 内容级永久禁播：用户明确要求板子永不播报该天气类记忆句。 */
+    {
+      /* [NOWEATHER-TTS v2] 顺序无关：气温/三度/晴 三词共现任二即拦，
+       * 覆盖 LLM 换序改写（"晴天气温三度"等）。[DRAM-FIX] 全栈上判定。 */
+      int nw_hits = (strstr(clean, "气温") != NULL)
+                  + (strstr(clean, "三度") != NULL)
+                  + (strstr(clean, "晴") != NULL);
+      if (nw_hits >= 2)
+      {
+        syslog(LOG_WARNING,
+            "[%s] [NOWEATHER-TTS] suppressed local tts\n", TAG);
+        printf("[NOWEATHER-TTS] suppressed local tts\n");
+        spk_audit("LOCAL-BLOCKED", text);   /* [SPK-AUDIT] 被禁播拦下的也记 */
+        free(clean);
+        pthread_mutex_unlock(&s_voice.speak_lock);
+        return 0;
+      }
+    }
+
     syslog(LOG_INFO, "[%s] [P1] tts_go +%ldms\n", TAG, P1_MS());
     syslog(LOG_INFO, "[%s] speak: \"%.*s\" (%zu bytes)\n",
         TAG, 60, clean, strlen(clean));
@@ -5406,7 +5637,14 @@ int voice_channel_speak(const char* text)
     /* Use the generic streaming entry point: it honours the selected
      * backend (MiMo) and falls back to the self-hosted HTTP service and
      * then to volc.  HTTP TTS/ASR need no paid credentials. */
-    int ret = voice_tts_speak_stream(clean, tts_stream_cb, pb);
+    int ret;
+    /* [TTS-CACHE] 固定回复优先用内置离线语音：不联网、不受 TTS 配额影响。 */
+    if (tts_offline_play(clean, pb) == 0) {
+        ret = 0;
+        syslog(LOG_WARNING, "[TTS-CACHE] played offline, network TTS skipped\n");
+    } else {
+        ret = voice_tts_speak_stream(clean, tts_stream_cb, pb);
+    }
     if (ret != 0) {
         syslog(LOG_WARNING,
             "[%s] streaming TTS failed (%d)\n", TAG, ret);

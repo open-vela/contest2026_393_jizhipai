@@ -121,6 +121,23 @@ int voice_tts_speak_stream(const char* text,
   int ret;
   int used_mimo = 0;
 
+  /* [LOCAL-TTS 2026-10-27] 自建 HTTP TTS 优先。
+   *
+   * 现状：MiMo 配额已耗尽（HTTP 429 "quota exhausted"），volc 又没有凭据，
+   * 于是本地除了那几句离线缓存之外全哑 —— 用户听到的就是"能开灯关灯，
+   * 但板子一声不吭"。旁边的 PC 上跑着 tts_server.py（edge-tts 后端），
+   * 免费无限量，音色和编译进固件的离线缓存出自同一套参数，
+   * 所以固定文案和任意文本是同一个声音。
+   *
+   * 服务不在线时 1.5 s 内放弃、回退旧链路，不会把对话挂住。 */
+  ret = http_tts_speak_stream(text, cb, user_data);
+  if (ret == 0)
+    {
+      return 0;
+    }
+  syslog(LOG_WARNING, "[%s] local http TTS failed (%d), falling back\n",
+         TAG, ret);
+
   /* [V509] Drive the chain from the selected backend.
    *
    * This used to call http_tts_speak_stream() first, unconditionally, and
