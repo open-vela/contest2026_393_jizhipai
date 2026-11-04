@@ -1,4 +1,4 @@
-# logs/ — AI Coding 日志（队号 393 · 竞智派）
+# logs/ — AI Coding 日志（队号 393 · 极智派）
 
 本目录是**实际提交的真实日志**，不是示例；脚手架自带的 `your-github-login/` 示例目录已删除。
 
