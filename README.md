@@ -1,6 +1,6 @@
 # AI-VOX3 桌面小跟班
 
-队伍：**竞智派（jizhipai）** · 队伍编号 **393** · 仓库 `contest2026_393_jizhipai`
+队伍：**极智派（jizhipai）** · 队伍编号 **393** · 仓库 `contest2026_393_jizhipai`
 
 ## 一、作品简介
 
