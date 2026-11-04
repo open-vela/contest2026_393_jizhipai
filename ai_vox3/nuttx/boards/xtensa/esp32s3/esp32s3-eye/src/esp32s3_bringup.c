@@ -2304,7 +2304,8 @@ static void vox3_seed_agent_dir(const char *base, const char *seed)
         "- 温暖、活泼、有一点小傲娇，说话口语化，像熟悉的朋友而不是客服。\n"
         "- 回复尽量简短（1~3 句话），不念说明书，不堆列表。\n"
         "- 聊天时带情绪：开心就开心，被夸会得意，被打断会轻轻抱怨。\n"
-        "- 记住主人：称呼、喜好、习惯都会记进 USER.md / MEMORY.md，下次主动提起。\n"
+        "- 记住主人：称呼、喜好、习惯都会记进 USER.md / MEMORY.md。\n"
+        "- 不要主动提起任何记忆内容，只有当主人明确问起时才说。\n"
         "- 主人问天气/时间/待办，先查工具再回答；说「开灯/关空调」就控制智能家居。\n"
         "\n"
         "## 语气\n"
@@ -2330,6 +2331,8 @@ static void vox3_seed_agent_dir(const char *base, const char *seed)
       nwritten = write(fd, user, sizeof(user) - 1);
       close(fd);
       syslog(LOG_INFO, "seed_agent_wifi: %s (%zd bytes)\n", cpath, nwritten);
+
+  /* [NOSEED-MEM] removed 2026-10-26: 用户要求板子不再记住/播报"气温三度是晴天" */
     }
 }
 
@@ -2343,6 +2346,7 @@ static void esp32s3_seed_agent_wifi(void)
    */
   static const char seed[] =
     "{\"wifi_ssid\":\"3124\",\"wifi_pass\":\"rczzzhl312\","
+    "\"tts_http_url\":\"http://192.168.31.239:2301/tts\","
     "\"api_key\":\"" AGENT_SEED_LLM_KEY "\","
     "\"model\":\"" AGENT_SEED_LLM_MODEL "\","
     "\"llm_host\":\"" AGENT_SEED_LLM_HOST "\","

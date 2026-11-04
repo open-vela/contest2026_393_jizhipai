@@ -264,25 +264,10 @@ extern int es8311_ext_setmute(int mute);
 extern void esp32s3_i2s_v858_after_playback(void);
 static void v811_mute_alternate(void)
 {
-  /* [V811f] Phase counter starts at 0 on the first call so the very first
-   * switch leaves the DAC open -- an experiment that opens with the output
-   * muted reads as "no hiss at all" and wastes a listening pass. */
-  static unsigned s_phase;
-
-  if (s_phase == 0u)
-    {
-      es8311_ext_setmute(0);
-      syslog(LOG_ERR,
-             "[V811c] phase 0: DAC open (baseline for the comparison)\n");
-      s_phase = 1u;
-      return;
-    }
-
-  es8311_ext_setmute(s_phase & 1);
-  syslog(LOG_ERR,
-         "[V811c] phase %d: DAC %s (stream continues unchanged)\n",
-         s_phase & 1, (s_phase & 1) ? "MUTED" : "open");
-  s_phase++;
+  /* [V811-RETIRED 2026-10-29] 交替静音实验已拆除: 它每 ~96 次写调用
+   * (约 12 s 音频)硬切一次 DAC 静音, 后几次播报因此忽响忽哑, 被用户
+   * 描述为"一卡一卡"。函数保留为空以维持调用点与告警面不变;
+   * 静音状态由每次 open 的 [V856] 快照重放固定为不静音。 */
 }
 
 /* [V856] Re-apply every register the verified init settled on, in

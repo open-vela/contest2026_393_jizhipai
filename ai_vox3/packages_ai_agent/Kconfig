@@ -225,7 +225,7 @@ config AI_AGENT_TTS_HTTP
 
 config AI_AGENT_TTS_HTTP_URL
 	string "HTTP TTS endpoint base URL"
-	default "http://42.48.185.89:2301/tts"
+	default "http://192.168.31.239:2301/tts"
 	depends on AI_AGENT_TTS_HTTP
 	---help---
 		Base URL of the self-hosted HTTP TTS service. The agent issues

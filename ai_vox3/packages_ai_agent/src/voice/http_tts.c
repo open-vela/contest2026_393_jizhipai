@@ -53,21 +53,23 @@
 #define HTTP_TTS_TAG "http_tts"
 
 #ifndef CONFIG_AI_AGENT_TTS_HTTP_URL
-#define CONFIG_AI_AGENT_TTS_HTTP_URL "http://172.16.88.1:2301/tts"
+/* [LOCAL-TTS 2026-10-27] 原来的 172.16.88.1 是编译机，板子跨网段够不到（实测 ping 不通）。
+ * 192.168.110.25 是用户 PC，与板子同网段，跑 tts_server.py。 */
+#define CONFIG_AI_AGENT_TTS_HTTP_URL "http://192.168.31.239:2301/tts"
 #endif
 
 /* config.json override key */
 #define HTTP_TTS_CFG_KEY "tts_http_url"
 
-#define HTTP_TTS_URL_MAX  256
+#define HTTP_TTS_URL_MAX  96   /* [LOCAL-TTS 2026-10-27] was 256; dram0_0_seg 只差 16 B，URL 实际 31 字符，96 足够 */
 #define HTTP_TTS_HDR_MAX  4096
 #define HTTP_TTS_CHUNK    3072   /* stream chunk size (2-4KB range) */
-#define HTTP_TTS_CONN_MS  4000   /* [V315] fail fast: 15s*4 left the voice
+#define HTTP_TTS_CONN_MS  1500  /* [LOCAL-TTS 2026-10-27] 服务离线时快速放弃 */   /* [V315] fail fast: 15s*4 left the voice
                                     * thread blocked for minutes when the
                                     * server is unreachable; 4s*2 still
                                     * covers the ~1s first-packet warm-up */
 #define HTTP_TTS_RECV_MS  8000   /* per-recv timeout */
-#define HTTP_TTS_CONN_RETRIES  2    /* retry a failed connect N times */
+#define HTTP_TTS_CONN_RETRIES  5  /* [LOCAL-TTS 2026-10-28] 1->5: survive LwIP TIME_WAIT connect refusal */
 #define HTTP_TTS_CONN_RETRY_MS 800  /* backoff between connect attempts */
 
 /* [V357] send() on this board has been measured failing with ENOMEM (errno 12)
@@ -126,6 +128,41 @@
 
 
 static const char *TAG = HTTP_TTS_TAG;
+
+/* [TTS-ABORT 2026-10-28] 允许 voice_channel 在打断旧 TTS 时，从另一个线程
+ * 立刻关掉 http_tts 线程正阻塞的 socket，使 recv() 立即报错退出、连接即时
+ * 释放，避免被放弃的句子一直占着连接直到服务器把整段（已放弃的）PCM 发完
+ * （LwIP 资源耗尽 -> 新连接收不到 body -> EIO(-5) -> 静音）。 */
+static volatile int      s_http_tts_abort_gen = -1; /* [TTS-ABORT-GEN] 被放弃的 speak 代数；-1=无 */
+static int               s_http_tts_fd    = -1;  /* 正在运行的 speak 持有的活动 fd */
+static volatile unsigned s_http_tts_gen     = 0;  /* [TTS-ABORT-GEN] speak 代数计数器 */
+static volatile unsigned s_http_tts_fd_gen  = 0;  /* s_http_tts_fd 所属代 */
+
+/* 安全关闭：fd 号 + 所属代双重匹配才真正 close。
+ * [TTS-ABORT-GEN 2026-10-29] 旧实现只比 fd 号：旧 speak 退出清理时它的 fd 号
+ * 可能已被新 speak 的 socket 复用，会把新 speak 的连接误关掉
+ * （实测 recv(header):16 EBUSY -> -EIO(-5) -> 回答静音）。 */
+#define HTTP_TTS_SAFE_CLOSE(fdp, gen) \
+    do { \
+        if (*(fdp) >= 0 && *(fdp) == s_http_tts_fd && \
+            s_http_tts_fd_gen == (unsigned)(gen)) { \
+            close(*(fdp)); \
+            s_http_tts_fd = -1; \
+        } \
+        *(fdp) = -1; \
+    } while (0)
+
+/* 从另一线程调用：放弃当前正在进行的 speak，立即关闭其 socket。 */
+void http_tts_abort_active(void)
+{
+    int f = s_http_tts_fd;
+
+    s_http_tts_abort_gen = (int)s_http_tts_gen;  /* [TTS-ABORT-GEN] 只标记当前代 */
+    if (f >= 0) {
+        close(f);   /* 让阻塞在 recv() 的 speak 线程立即报错退出 */
+        s_http_tts_fd = -1;
+    }
+}
 
 /* Base URL, resolved at init() time. */
 static char s_url[HTTP_TTS_URL_MAX] = CONFIG_AI_AGENT_TTS_HTTP_URL;
@@ -544,6 +581,9 @@ static int http_tts_speak_stream_once(const char *text,
                           void *user_data)
 {
     s_last_stream_bytes = 0;
+    /* [TTS-ABORT-GEN 2026-10-29] 用代数替代全局 abort 布尔：新 speak 开新代，
+     * 旧代的 abort 标志自然失效；旧 speak 清理时也因代数不匹配不会误关新 socket。 */
+    unsigned mygen = ++s_http_tts_gen;
 
     if (!text || !cb) {
         return -EINVAL;
@@ -621,6 +661,12 @@ static int http_tts_speak_stream_once(const char *text,
     int fd = -1;
 
     for (int attempt = 0; attempt < HTTP_TTS_CONN_RETRIES; attempt++) {
+        if (s_http_tts_abort_gen == (int)mygen) {   /* [TTS-ABORT-GEN] 连接阶段也被打断 */
+            free(enc);
+            free(req_path);
+            free(req);
+            return -ECONNABORTED;
+        }
         if (attempt > 0) {
             usleep(HTTP_TTS_CONN_RETRY_MS * 1000);
         }
@@ -649,8 +695,7 @@ static int http_tts_speak_stream_once(const char *text,
 
         syslog(LOG_WARNING, "[%s] connect %s:%d attempt %d/%d failed: %d\n",
             TAG, host, port, attempt + 1, HTTP_TTS_CONN_RETRIES, errno);
-        close(fd);
-        fd = -1;
+        HTTP_TTS_SAFE_CLOSE(&fd, mygen);
     }
 
     if (fd < 0) {
@@ -661,6 +706,9 @@ static int http_tts_speak_stream_once(const char *text,
         free(req);
         return -ECONNREFUSED;
     }
+
+    s_http_tts_fd = fd;          /* [TTS-ABORT] 活动 fd 登记，供 abort 从另一线程关闭 */
+    s_http_tts_fd_gen = mygen;   /* [TTS-ABORT-GEN] 登记该 fd 所属代 */
 
 
     /* [V68] Poll instead of relying on the 8 s SO_RCVTIMEO: the slower
@@ -721,8 +769,8 @@ static int http_tts_speak_stream_once(const char *text,
           {
             
             diag_report("TTS_SEND_FAIL");
-            
-            close(fd);
+
+            HTTP_TTS_SAFE_CLOSE(&fd, mygen);
             free(enc);
             free(req_path);
             free(req);
@@ -757,10 +805,17 @@ static int http_tts_speak_stream_once(const char *text,
         }
 
         if (n < 0) {
+            if (s_http_tts_abort_gen == (int)mygen) {   /* [TTS-ABORT-GEN] 被打断，fd 已由另一线程关 */
+                HTTP_TTS_SAFE_CLOSE(&fd, mygen);
+                free(enc);
+                free(req_path);
+                free(req);
+                return -ECONNABORTED;
+            }
             diag_report("TTS_HDR_FAIL");
             syslog(LOG_ERR, "[%s] recv(header): %d\n", TAG, errno);
-            
-            close(fd);
+
+            HTTP_TTS_SAFE_CLOSE(&fd, mygen);
             free(enc);
             free(req_path);
             free(req);
@@ -768,8 +823,8 @@ static int http_tts_speak_stream_once(const char *text,
         }
         if (n == 0) {
             syslog(LOG_ERR, "[%s] closed before full headers\n", TAG);
-            
-            close(fd);
+
+            HTTP_TTS_SAFE_CLOSE(&fd, mygen);
             free(enc);
             free(req_path);
             free(req);
@@ -787,7 +842,7 @@ static int http_tts_speak_stream_once(const char *text,
             }
             if (status < 200 || status >= 300) {
                 syslog(LOG_ERR, "[%s] HTTP %d from TTS service\n", TAG, status);
-                close(fd);
+                HTTP_TTS_SAFE_CLOSE(&fd, mygen);
                 free(enc);
                 free(req_path);
                 free(req);
@@ -816,8 +871,8 @@ static int http_tts_speak_stream_once(const char *text,
 
         if (hdr_len >= (int)sizeof(hdr) - 1) {
             syslog(LOG_ERR, "[%s] header section too large\n", TAG);
-            
-            close(fd);
+
+            HTTP_TTS_SAFE_CLOSE(&fd, mygen);
             free(enc);
             free(req_path);
             free(req);
@@ -839,6 +894,9 @@ static int http_tts_speak_stream_once(const char *text,
          * body already arrived. */
 
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (s_http_tts_abort_gen == (int)mygen) {   /* [TTS-ABORT-GEN] 被打断，fd 已由另一线程关 */
+                break;
+            }
             if (++body_idle <= HTTP_TTS_EAGAIN_RETRIES) {
                 continue;
             }
@@ -846,7 +904,7 @@ static int http_tts_speak_stream_once(const char *text,
             if (body_bytes == 0) {
                 diag_report("TTS_BODY_NODATA");
                 syslog(LOG_ERR, "[%s] recv() timed out (no body)\n", TAG);
-                close(fd);
+                HTTP_TTS_SAFE_CLOSE(&fd, mygen);
                 free(enc);
                 free(req_path);
                 free(req);
@@ -857,10 +915,17 @@ static int http_tts_speak_stream_once(const char *text,
         }
 
         if (n < 0) {
+            if (s_http_tts_abort_gen == (int)mygen) {   /* [TTS-ABORT-GEN] 被打断，fd 已由另一线程关 */
+                HTTP_TTS_SAFE_CLOSE(&fd, mygen);
+                free(enc);
+                free(req_path);
+                free(req);
+                return -ECONNABORTED;
+            }
             diag_report("TTS_BODY_FAIL");
             syslog(LOG_ERR, "[%s] recv(body): %d\n", TAG, errno);
-            
-            close(fd);
+
+            HTTP_TTS_SAFE_CLOSE(&fd, mygen);
             free(enc);
             free(req_path);
             free(req);
@@ -892,7 +957,7 @@ static int http_tts_speak_stream_once(const char *text,
     /* Final (empty) chunk marker. */
     cb(NULL, 0, 1, user_data);
 
-    close(fd);
+    HTTP_TTS_SAFE_CLOSE(&fd, mygen);
     free(enc);
     free(req_path);
     free(req);
@@ -901,6 +966,79 @@ static int http_tts_speak_stream_once(const char *text,
 
 /* [V361] 对外仍是 http_tts_speak_stream()：整条请求最多 3 次，每次换全新
  * socket。只有在“一个字节都没播出去”时才重试，避免重复播放同一段音频。 */
+
+/* [ONE-VOICE 2026-10-27] 探测本地 TTS 服务是否可达。
+ *
+ * 只做 TCP connect，不发请求、不等响应，同网段 20 ms 内返回。
+ * aivox 在 tts/start 时用它决定这一句是"用本地音色重念"还是"照旧播
+ * 服务端音频"：服务不在就走服务端音频，绝不把云端回答变成哑巴。 */
+int http_tts_ping(void)
+{
+    char host[128];
+    char path[256];
+    int  port = 80;
+    int  fd;
+    struct sockaddr_in addr;
+    struct in_addr     ip;
+
+    if (parse_url(s_url, host, sizeof(host), &port, path, sizeof(path)) != 0)
+        {
+            return -EINVAL;
+        }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t)port);
+
+    if (inet_pton(AF_INET, host, &ip) == 1)
+        {
+            addr.sin_addr = ip;
+        }
+    else
+        {
+            struct hostent *he = gethostbyname(host);
+
+            if (he == NULL || he->h_addr == NULL)
+                {
+                    return -ENOENT;
+                }
+
+            memcpy(&addr.sin_addr, he->h_addr, sizeof(struct in_addr));
+        }
+
+    /* [PINGRETRY 2026-10-30] 单次探测是误判源：PC 端 edge-tts 正在给其他
+     * 连接做流式合成时，accept/SYN 可能短暂积压，一次超时就把整个回答
+     * 降级播云端男声（实测"一下女声一下大叔声"）。改 3 次探测（间隔
+     * 150ms）：健康时首次即成功零开销；真宕机最多多花 ~1.7s 才降级。 */
+    for (int attempt = 0; attempt < 3; attempt++)
+        {
+            fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0)
+                {
+                    syslog(LOG_ERR, "[http_tts] ping socket(): %d\n", errno);
+                    return -EIO;
+                }
+
+            if (connect_timeout(fd, (struct sockaddr *)&addr,
+                                sizeof(addr), 800) == 0)
+                {
+                    close(fd);
+                    return 0;
+                }
+
+            syslog(LOG_WARNING,
+                   "[http_tts] ping attempt %d/3 failed: %d\n",
+                   attempt + 1, errno);
+            close(fd);
+
+            if (attempt < 2)
+                {
+                    usleep(150000);
+                }
+        }
+
+    return -ETIMEDOUT;
+}
 
 int http_tts_speak_stream(const char *text,
                           voice_tts_chunk_cb cb,
@@ -913,11 +1051,11 @@ int http_tts_speak_stream(const char *text,
         {
             ret = http_tts_speak_stream_once(text, cb, user_data);
 
-            if (ret == 0)
+            if (ret == 0 || ret == -ECONNABORTED)
                 {
-                    if (attempt > 1)
+                    if (attempt > 1 && ret == 0)
                         {
-                            
+
                         }
                     break;
                 }

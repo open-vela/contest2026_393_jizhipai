@@ -18,6 +18,7 @@
 # packages/agent/Makefile
 ############################################################################
 
+CSRCS += src/sensor_chat.c
 include $(APPDIR)/Make.defs
 
 MODULE = $(CONFIG_EXAMPLES_AI_AGENT_VELA)

@@ -391,7 +391,7 @@
 #define AGENT_CFG_KEY_VOLC_ASR_CLUSTER "volc_asr_cluster"
 
 /* Default TTS speaker and cluster */
-#define AGENT_VOICE_DEFAULT_SPEAKER "zh_male_beijingxiaoye_emo_v2_mars_bigtts"
+#define AGENT_VOICE_DEFAULT_SPEAKER "zh_female_qingxinnvsheng_mars_bigtts"  /* [CALM-VOICE] 原来是 zh_male_beijingxiaoye_emo_v2_mars_bigtts（北京小爷，男声）——mimo 失败回退到 volc 时用户就听到男大叔音。 */
 #define AGENT_VOICE_DEFAULT_CLUSTER "volcano_tts"
 
 /* WebSocket TTS output sample rate (big-model voices output 24kHz) */

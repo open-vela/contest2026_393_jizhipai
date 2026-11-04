@@ -360,13 +360,16 @@ int servo_shake(void)
 /* 上电自检: 两轴各扫 0->180->90，肉眼即可确认舵机在线 */
 int servo_self_test(void)
 {
-  syslog(LOG_INFO, "servo: self-test start\n");
-  servo_set_ch(&g_pan, 0);   usleep(400000);
-  servo_set_ch(&g_pan, 180); usleep(400000);
-  servo_set_ch(&g_pan, 90);  usleep(300000);
-  servo_set_ch(&g_tilt, 0);   usleep(400000);
-  servo_set_ch(&g_tilt, 180); usleep(400000);
-  servo_set_ch(&g_tilt, 90);  usleep(300000);
+  /* [V1263] 原来是 0->180 扫全行程：会撞机械限位（齿轮顶死、嗡嗡响），
+   * 而且开机第一眼就是"猛低一下头再猛抬起来"——很容易被当成故障。
+   * 改成中位附近 +/-20 度的小幅摆动，验证舵机在线足够了。 */
+  syslog(LOG_INFO, "servo: self-test start (small sweep)\n");
+  servo_set_ch(&g_pan, 70);   usleep(300000);
+  servo_set_ch(&g_pan, 110);  usleep(300000);
+  servo_set_ch(&g_pan, 90);   usleep(200000);
+  servo_set_ch(&g_tilt, 70);  usleep(300000);
+  servo_set_ch(&g_tilt, 110); usleep(300000);
+  servo_set_ch(&g_tilt, 90);  usleep(200000);
   syslog(LOG_INFO, "servo: self-test done\n");
   return OK;
 }
@@ -385,7 +388,7 @@ int servo_self_test(void)
  * 归中会和它们打架。只有在"请求角度"与"实际最后写入角度"偏差超过
  * SERVO_KEEPALIVE_DRIFT_DEG 时才重新写一次，用于纠正偏差。
  */
-#define SERVO_KEEPALIVE_PERIOD_MS   200
+#define SERVO_KEEPALIVE_PERIOD_MS   100   /* [V1275] 200ms 一拍 => 最高 200ms 才动一次，跟手迟滞明显；100ms 减半 */
 #define SERVO_KEEPALIVE_DRIFT_DEG   2
 
 

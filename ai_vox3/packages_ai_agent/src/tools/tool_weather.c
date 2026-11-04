@@ -119,7 +119,7 @@ static int weather_fetch_and_write(void)
 
   snprintf(path, sizeof(path),
            "/v1/forecast?latitude=%s&longitude=%s"
-           "&current=temperature_2m,weather_code",
+           "&current=temperature_2m,weather_code,relative_humidity_2m",
            WEATHER_LAT, WEATHER_LON);
 
   memset(buf, 0, sizeof(buf));
@@ -148,6 +148,8 @@ static int weather_fetch_and_write(void)
 
   cJSON *temp = cJSON_GetObjectItem(current, "temperature_2m");
   cJSON *code = cJSON_GetObjectItem(current, "weather_code");
+  /* [V1280] 湿度：UI 的湿度行就吃这个字段 */
+  cJSON *hum  = cJSON_GetObjectItem(current, "relative_humidity_2m");
   if (temp == NULL || code == NULL ||
       !cJSON_IsNumber(temp) || !cJSON_IsNumber(code))
     {
@@ -167,12 +169,14 @@ static int weather_fetch_and_write(void)
       return -1;
     }
 
-  fprintf(f, "%s %d\n", label, t);
+  /* [V1280] 第三个字段 = 相对湿度(%)，取不到写 -1（UI 会显示 --%） */
+  int hm = (hum != NULL && cJSON_IsNumber(hum)) ? (int)(hum->valuedouble) : -1;
+  fprintf(f, "%s %d %d\n", label, t, hm);
   fclose(f);
 
   cJSON_Delete(root);
   ret = 0;
-  fprintf(stderr, "weather: updated -> %s %d\n", label, t);
+  fprintf(stderr, "weather: updated -> %s %d hum=%d\n", label, t, hm);
   return ret;
 }
 
@@ -222,6 +226,12 @@ int tool_refresh_weather_execute(const char *input_json,
 
 void weather_tool_init(void)
 {
+  /* [NOWEATHER-BOOT] 用户要求开机不要显示/播报天气（已禁后台刷新，开机无天气卡片）。
+   * 不再启动后台刷新线程：/tmp/weather.txt 不会自动生成，开机屏幕无天气卡片。
+   * 需要天气时 LLM 仍可调用 refresh_weather 工具按需获取（不受影响）。 */
+  /* [V1280] 恢复后台刷新：用户要求在天气页看到真实温湿度，而
+   * /tmp/weather.txt 只由这里产生。开机 30s 后抓第一次，之后每 10 分钟
+   * 一次；失败不覆盖旧文件，屏幕不会跳回 --。 */
   pthread_t tid;
   pthread_attr_t attr;
 

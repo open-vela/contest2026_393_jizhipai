@@ -44,9 +44,18 @@ void http_tts_set_url(const char *url);
  * is delivered through `cb` as it arrives from the server.  Returns 0
  * on success, or a negative errno on transport / HTTP error so the
  * caller can fall back to another backend. */
+/* [ONE-VOICE 2026-10-27] 探测 TTS 服务是否可达（只做 TCP connect，不产生请求）。
+ * 返回 0 = 在线，负值 = 不可达（调用方应回退到服务端音频）。 */
+int http_tts_ping(void);
+
 int http_tts_speak_stream(const char *text,
                           voice_tts_chunk_cb cb,
                           void *user_data);
+
+/* [TTS-ABORT 2026-10-28] 从另一线程放弃正在进行的 speak，立即关掉其 socket，
+ * 让阻塞在 recv() 的 http_tts 线程即时退出、连接释放（修复被放弃句子一直占
+ * 连接导致 LwIP 耗尽、新 TTS 收不到 body 而 EIO 静音）。 */
+void http_tts_abort_active(void);
 
 /* [V68] Post a short diagnostic tag to the TTS bridge's /diag endpoint.
  * Log-only on the server side, two-byte reply, so it is cheap enough to use

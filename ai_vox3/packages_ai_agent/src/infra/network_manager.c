@@ -98,44 +98,130 @@ bool network_is_connected(void)
  *   undefined reference。这里直接调 netlib_set_ipv4dnsaddr() 并顺手写
  *   resolv.conf，两件事都在本地做完。
  */
-/* [V1041] Application-layer static IP.
+/* [V1257] Does wlan0 already have a default route?  /proc/net/route has
+ * one line per route, "Iface Destination Gateway Flags ..."; the default
+ * route is the entry with Destination 00000000.  Returns true as soon as
+ * any such entry exists. */
+static bool route_has_default(void)
+{
+    FILE* fp = fopen("/proc/net/route", "r");
+    char line[256];
+    bool found = false;
+
+    if (!fp)
+      {
+        return false;
+      }
+
+    while (fgets(line, sizeof(line), fp))
+      {
+        char iface[32];
+        unsigned long dest;
+
+        /* "wlan0<TAB>00000000<TAB>..." -> a default route exists */
+        if (sscanf(line, "%31s %lx", iface, &dest) == 2 && dest == 0)
+          {
+            found = true;
+            break;
+          }
+      }
+
+    fclose(fp);
+    return found;
+}
+
+/* [V1257] On-site network switch: the subnet is no longer compiled in.
  *
- * The K230's SD-card script hard-codes VOX3_IP = 192.168.110.154 for this
- * board (the comment there even names our MAC 90-70-69-16-2a-3c).  DHCP
- * currently leases us .155, so the face packets go nowhere.  netinit is
- * left alone - it still associates and DHCPs, which keeps routing and the
- * fallback behaviour intact - and we simply overwrite the address once an
- * address exists.
+ * config_store keys (written by the CLI "set_net <ip> <gw>"):
+ *   net.static_ip - force wlan0 to this IPv4 address (mask /24)
+ *   net.static_gw - gateway for the forced path
  *
- * Idempotent and quiet: it reads the current address first and does
- * nothing at all when it already matches, so it can be called from
- * ensure_dns() on every "connected" event without flooding the log.
- */
+ * Both keys empty (the default): DHCP's result is kept as-is - no
+ * set_ipv4netmask / set_ipv4addr / set_dripv4addr override at all.  The one
+ * rescue kept is the route fix-up: when /proc/net/route shows no default
+ * route, wlan0's current address is taken, its last octet is replaced with
+ * .1 and that is installed as the gateway (phone hotspots and ordinary
+ * routers answer on .1).
+ *
+ * net.static_ip configured: the former V1041 forced-static path runs
+ * (address + /24 mask); the gateway comes from net.static_gw or, when that
+ * key is empty, is derived as the .1 of the static IP's /24.
+ *
+ * Idempotent and quiet, so it can stay in ensure_dns() on every
+ * "connected" event. */
 static void ensure_static_ip(void)
 {
-    char ip[INET_ADDRSTRLEN];
-    struct in_addr cur;
+    char cfg_ip[64] = { 0 };
+    char cfg_gw[64] = { 0 };
     struct in_addr want;
+    struct in_addr gw;
+    struct in_addr cur;
+    struct in_addr mask;
+    char ip[INET_ADDRSTRLEN];
+    bool have_ip;
+    bool have_gw;
     int rc;
 
-    if (inet_pton(AF_INET, "192.168.110.154", &want) != 1)
+    have_ip = claw_config_get("net.static_ip", cfg_ip, sizeof(cfg_ip)) == OK
+              && cfg_ip[0] != '\0'
+              && inet_pton(AF_INET, cfg_ip, &want) == 1;
+    have_gw = claw_config_get("net.static_gw", cfg_gw, sizeof(cfg_gw)) == OK
+              && cfg_gw[0] != '\0'
+              && inet_pton(AF_INET, cfg_gw, &gw) == 1;
+
+    if (have_ip)
+      {
+        /* Forced static path (former V1041 behaviour). */
+        memset(&cur, 0, sizeof(cur));
+        if (netlib_get_ipv4addr("wlan0", &cur) != OK ||
+            cur.s_addr != want.s_addr)
+          {
+            /* Only d_ipaddr is rewritten by SIOCSIFADDR (netdev_ioctl.c:343),
+             * so the netmask and default route set around this call survive. */
+            rc = netlib_set_ipv4addr("wlan0", &want);
+            inet_ntop(AF_INET, &want, ip, sizeof(ip));
+            syslog(rc == OK ? LOG_INFO : LOG_ERR,
+                   "[V1257] static ip %s rc=%d\n", ip, rc);
+          }
+
+        if (!have_gw)
+          {
+            gw = want;
+            gw.s_addr = (want.s_addr & htonl(0xffffff00)) | htonl(1);
+          }
+
+        inet_pton(AF_INET, "255.255.255.0", &mask);
+        netlib_set_ipv4netmask("wlan0", &mask);
+        rc = netlib_set_dripv4addr("wlan0", &gw);
+        inet_ntop(AF_INET, &gw, ip, sizeof(ip));
+        syslog(LOG_INFO, "[V1257] static gw %s rc=%d\n", ip, rc);
+        return;
+      }
+
+    /* Default: keep DHCP's lease untouched; only rescue a missing default
+     * route (the old V526 symptom: empty route table, every connect times
+     * out). */
+    if (route_has_default())
       {
         return;
       }
 
     memset(&cur, 0, sizeof(cur));
-    if (netlib_get_ipv4addr("wlan0", &cur) == OK &&
-        cur.s_addr == want.s_addr)
+    if (netlib_get_ipv4addr("wlan0", &cur) != OK || cur.s_addr == 0)
       {
-        return;                     /* already ours, nothing to say */
+        return;                     /* no address yet, nothing to rescue */
       }
 
-    /* Only d_ipaddr is rewritten by SIOCSIFADDR (netdev_ioctl.c:343), so
-     * the netmask and default route set around this call survive. */
-    rc = netlib_set_ipv4addr("wlan0", &want);
-    inet_ntop(AF_INET, &want, ip, sizeof(ip));
-    syslog(rc == OK ? LOG_INFO : LOG_ERR,
-           "[V1041] static ip %s rc=%d\n", ip, rc);
+    if (!have_gw)
+      {
+        gw = cur;
+        gw.s_addr = (cur.s_addr & htonl(0xffffff00)) | htonl(1);
+      }
+
+    rc = netlib_set_dripv4addr("wlan0", &gw);
+    inet_ntop(AF_INET, &gw, ip, sizeof(ip));
+    syslog(LOG_INFO, "[V1257] no default route, rescue gw %s rc=%d\n",
+           ip, rc);
 }
 
 static void ensure_dns(void)
@@ -158,40 +244,65 @@ static void ensure_dns(void)
      *     42.48.185.89 —— 那些"能通"的印象其实也是超时。
      *
      * 为什么没有路由：编译期 CONFIG_NETINIT_DRIPADDR=0x0a000001 即 10.0.0.1，
-     * 那是另一个网络的网关，跟本机实际网段 192.168.110.0/24 毫无关系。
+     * 那是另一个网络的网关，跟本机实际网段 192.168.31.0/24 毫无关系。
      * DHCP 模式下这个静态值不参与路由表写入，而本项目**没有任何代码**
      * 在 DHCP 之后补设默认路由（grep netlib_set_dripv4addr 在 packages/ 下
      * 零命中）。
      *
-     * 所以这里显式补上：掩码按 255.255.255.0，网关取同网段内已探测到的
-     * 192.168.110.1。写错网关的症状是"能建连但发不出去"，而完全不写
-     * 默认路由的症状是"建连就超时" —— 现象已确认是后者。
+     * [V1257] 现场换网后子网不再写死：默认保留 DHCP 结果，只在路由表
+     * 确实没有默认路由时补一条救急网关（详见 ensure_static_ip()）。
      */
     {
-        struct in_addr mask;
-        struct in_addr gw;
-        int rc;
-
-        inet_pton(AF_INET, "255.255.255.0", &mask);
-        rc = netlib_set_ipv4netmask("wlan0", &mask);
-        syslog(LOG_INFO, "[%s] ensure_net: netmask <- 255.255.255.0 (rc=%d)\n",
-               TAG, rc);
-
+        /* [V1257] Subnet lock removed - netmask/address/gateway are no
+         * longer forced here.  ensure_static_ip() keeps DHCP's result
+         * unless net.static_ip / net.static_gw are configured, and only
+         * rescues a missing default route (see its comment). */
         ensure_static_ip();
-
-        if (inet_pton(AF_INET, "192.168.110.1", &gw) == 1) {
-            rc = netlib_set_dripv4addr("wlan0", &gw);
-            syslog(LOG_INFO,
-                   "[%s] ensure_net: default route <- 192.168.110.1 (rc=%d)\n",
-                   TAG, rc);
-        }
     }
 
-    /* 用户通过 setdns 命令存过的值优先（network_set_dns 会写进 config_store） */
-    if (claw_config_get("net.dns_primary", primary, sizeof(primary)) != OK
-        || primary[0] == '\0') {
-        strncpy(primary, fallbacks[0], sizeof(primary) - 1);
-        primary[sizeof(primary) - 1] = '\0';
+        /* [V1262] Resolver priority: default-route gateway first.
+     *
+     * On site the router / phone-hotspot DNS forwarder is what actually
+     * answers; public DNS (223.5.5.5) was measured unreachable on the
+     * venue-like network while the gateway answered.  Stored
+     * net.dns_primary is only used when no default route exists, and the
+     * public list is the last resort. */
+    {
+        char gwbuf[64] = { 0 };
+        FILE* gfp = fopen("/proc/net/route", "r");
+        char gline[256];
+
+        while (gfp && fgets(gline, sizeof(gline), gfp)) {
+            char giface[32];
+            unsigned long gdest;
+            unsigned long ggw;
+
+            if (sscanf(gline, "%31s %lx %lx", giface, &gdest, &ggw) == 3
+                && gdest == 0 && ggw != 0) {
+                struct in_addr ga;
+
+                ga.s_addr = (in_addr_t)ggw;
+                inet_ntop(AF_INET, &ga, gwbuf, sizeof(gwbuf));
+                break;
+            }
+        }
+        if (gfp) {
+            fclose(gfp);
+        }
+
+        if (gwbuf[0] != '\0') {
+            strncpy(primary, gwbuf, sizeof(primary) - 1);
+            primary[sizeof(primary) - 1] = '\0';
+            syslog(LOG_INFO, "[%s] [V1262] resolver <- default gw %s\n",
+                   TAG, gwbuf);
+        } else if (claw_config_get("net.dns_primary", primary,
+                                   sizeof(primary)) != OK
+                   || primary[0] == '\0') {
+            strncpy(primary, fallbacks[0], sizeof(primary) - 1);
+            primary[sizeof(primary) - 1] = '\0';
+            syslog(LOG_WARNING, "[%s] [V1262] no default route - "
+                   "resolver <- %s\n", TAG, fallbacks[0]);
+        }
     }
 
     if (inet_pton(AF_INET, primary, &dns_addr) != 1) {
@@ -234,8 +345,37 @@ static void ensure_dns(void)
     }
 }
 
+extern int nsh_commands_init(void);
+extern int nsh_commands_start(void);
+
+/* [V1258] Boot fallbacks anchored in network_manager.c.
+ *
+ * The agent_main object that actually reaches the link no longer calls
+ * nsh_commands_init()/start() or network_wifi_reconnect() - those calls
+ * sit in a newer agent_main.c than the object the archive serves (see
+ * the 2026-11-04 stale-object investigation).  Changes made in THIS
+ * file do reach the link reliably, so anchor the boot-time behaviour
+ * here:
+ *   1. Start the CLI (set_wifi / set_net / wifi_reconnect) on first
+ *      entry - the whole nsh_commands module would otherwise be
+ *      dead-stripped because nothing references it.
+ *   2. If netinit failed to associate, retry once with the credentials
+ *      saved by set_wifi in config_store (wifi_ssid/wifi_pass). */
 int network_wait_connected(uint32_t timeout_ms)
 {
+    static bool s_boot_cli_started;
+    static bool s_boot_retry_done;
+    int wait_polls = 0;
+
+    if (!s_boot_cli_started) {
+        s_boot_cli_started = true;
+        nsh_commands_init();
+        nsh_commands_start();
+        syslog(LOG_INFO,
+               "[%s] [V1258] CLI started (set_wifi/set_net available)\n",
+               TAG);
+    }
+
     if (timeout_ms == 0) {
         if (network_is_connected()) {
             ensure_dns();
@@ -260,6 +400,17 @@ int network_wait_connected(uint32_t timeout_ms)
              * resolv.conf 拿 DNS，不设就是永久解析失败。见 ensure_dns() 注释。 */
             ensure_dns();
             return OK;
+        }
+
+        /* [V1258] netinit has had ~8 s and still no link: retry once
+         * with saved credentials before giving the deadline a chance. */
+        if (!s_boot_retry_done && ++wait_polls >= 16) {
+            s_boot_retry_done = true;
+            syslog(LOG_WARNING,
+                   "[%s] [V1258] no link after 8 s - retry with saved WiFi credentials\n",
+                   TAG);
+            network_wifi_reconnect();
+            continue;
         }
 
         struct timespec now;

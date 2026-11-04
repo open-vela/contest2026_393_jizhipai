@@ -30,7 +30,7 @@
 #ifdef CONFIG_NETINIT_WAPI_SSID
 #  undef CONFIG_NETINIT_WAPI_SSID
 #endif
-#define CONFIG_NETINIT_WAPI_SSID "3124"
+#define CONFIG_NETINIT_WAPI_SSID "31246"
 #ifdef CONFIG_NETINIT_WAPI_PASSPHRASE
 #  undef CONFIG_NETINIT_WAPI_PASSPHRASE
 #endif
@@ -267,7 +267,7 @@ int netinit_associate(FAR const char *ifname)
    * first again, on the clean driver. */
   /* [V618] 3124 first again: only the FIRST connect attempt of a boot
    * can complete, so a candidate that is merely absent burns the boot. */
-  static const char *g_ssid_candidates[] = {"3124", "31246"};
+  static const char *g_ssid_candidates[] = {"31246"};
   int g_ncand = (int)(sizeof(g_ssid_candidates) / sizeof(g_ssid_candidates[0]));
   ret = -ENOENT;
   for (int ci = 0; ci < g_ncand; ci++)

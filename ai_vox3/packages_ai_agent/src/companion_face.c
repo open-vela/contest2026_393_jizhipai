@@ -92,7 +92,7 @@ static const char *TAG = "companion_face";
 #endif
 
 /* 1.5s 没人脸就算跟丢。 */
-#define CF_LOST_FACE_MS        1500
+#define CF_LOST_FACE_MS        3500    /* [V1274] 1.5 s of gap made the head sweep on its own */
 
 /* 长时间没人就慢慢回中位的间隔。 */
 #define CF_RECENTER_MS         900
@@ -102,7 +102,22 @@ static const char *TAG = "companion_face";
 #define CF_REJECT_MAX          5
 
 /* 死区，误差小于这个不动，避免一直微调。 */
-#define CF_DEADBAND            10
+/* [V1265] 跟丢扫视：以 90 度为中心左右各扫 30 度 */
+#define CF_PAN_CENTER          90
+#define CF_SWEEP_SPAN          12     /* [V1275] ±30 度太夸张，像乱甩；±12 度是"张望" */
+
+/* [V1266] 闭环单拍最大转角（度） */
+#define CF_STEP_MAX            9      /* [V1275] 4 deg@7.6Hz=30 deg/s 太慢；9 度/包≈68 deg/s */
+
+#define CF_DEADBAND            20     /* [V1275] 30 让画面里偏 3% 才动，肉眼就是反应慢 */
+
+/* [V1268] tilt 单独一套参数：垂直方向不需要跟 pan 一样灵敏，
+ * 否则人脸轻微上下晃动就会让头部大幅俯仰，看着很"乱"。 */
+#define CF_TILT_DEADBAND       28     /* [V1275] 4% -> 2.8% 画面高 */
+#define CF_TILT_SETPOINT       560    /* [V1272] 平视时 cy 的自然落点，不是 500 */
+#define CF_TILT_KP_D           0.006f /* [V1275] 轻阻尼 */
+#define CF_TILT_KP             0.034f /* [V1275] 蹲下起立都要跟得上 */
+#define CF_TILT_STEP_MAX       9      /* [V1275] 9 度/包 ≈ 68 deg/s，蹲下不再拖 */
 
 /* [V1043] Smallest servo-angle correction worth making, in
  * degrees.  This is the term that actually gates motion: the
@@ -115,11 +130,11 @@ static const char *TAG = "companion_face";
 /* 限位。机械上 PAN 可以到 150，但留余量。 */
 #define CF_PAN_MIN             10
 #define CF_PAN_MAX             170
-#define CF_TILT_MIN            20
-#define CF_TILT_MAX            160
+#define CF_TILT_MIN            55      /* [V1263] 20 -> 55: 别低头看到地面 */
+#define CF_TILT_MAX            125     /* [V1263] 160 -> 125: 别抬头看天花板 */
 
 /* 每拍最大转角，限速。 */
-#define CF_SLEW_PER_TICK       12
+#define CF_SLEW_PER_TICK       20     /* [V1275] 12 度/拍=240 deg/s，卡住大角度回追 */
 
 /* 到位后的刷新间隔（ms）。到位就不动，但保活线程会重发，
  * 所以这里只是"不再更新目标角度"，不主动停 PWM。 */
@@ -146,12 +161,13 @@ static const char *TAG = "companion_face";
  * desk), so this loop is open - moving the head cannot change what
  * the camera sees, so there is no feedback path to oscillate.
  */
-#define CF_ABS_PAN_GAIN        0.16f
-#define CF_ABS_TILT_GAIN       0.14f
+#define CF_ABS_PAN_GAIN        0.30f   /* [V1263] 0.16 太小: cx 只波动 +/-178 时云台只转 12 度, 看不出在跟 */
+#define CF_ABS_TILT_GAIN       0.08f   /* [V1263] 0.14 会把云台甩到 148 度抬头看天花板 */
 
 /* 比例累积律的增益（摄像头在云台上时才用）。 */
 #ifndef CF_KP
-#  define CF_KP                0.06f
+#  define CF_KP                0.030f  /* [V1275] 0.020 跟手太肉；0.050 才会极限环 */
+#  define CF_KP_D              0.008f  /* [V1275] 0.020 阻尼吃掉大半比例项，反向拖慢 */
 #endif
 
 /* ------------------------------------------------------------ 状态 */
@@ -168,6 +184,17 @@ struct cf_face_s
 
 static struct cf_face_s g_face = { -1, 0, 0, 0, 0, 0 };
 static int g_reject_cnt;
+static int64_t g_pin_since_ms;   /* [V1266] 贴限位起始时刻 */
+static float g_pan_acc;          /* [V1267] pan 浮点余数 */
+static int g_prev_ex;            /* [V1271] 上一包的误差（千分比） */
+static int g_prev_ey;            /* [V1272] 上一包的纵向误差 */
+static int64_t g_prev_ey_stamp;  /* [V1272] 上一包的到达时刻 */
+static int g_prev_ey_valid;      /* [V1272] g_prev_ey 是否有效 */
+static int64_t g_prev_ex_stamp;  /* [V1271] 上一包的到达时刻 */
+static int g_prev_ex_valid;      /* [V1271] g_prev_ex 是否有效 */
+static float g_tilt_acc;         /* [V1267] tilt 浮点余数 */
+static int64_t g_consumed_stamp; /* [V1270] 已经消费过的人包时间戳 */
+static int64_t g_prev_pkt_ms;    /* [V1270] 上一个包的到达时刻 */
 static int g_rx_lines;
 static int g_face_frames;
 
@@ -558,13 +585,50 @@ static void cf_update_targets(void)
   int64_t t = now_ms();
   int fresh = (g_face.x >= 0) && ((t - g_face.stamp_ms) < CF_LOST_FACE_MS);
 
+  /* [V1270] 关键修复：一帧数据只能消费一次。
+   *
+   * 控制环 20Hz，而 K230 的包可能只有 3~6 Hz；CF_LOST_FACE_MS 是 1500ms，
+   * 这个窗口里 fresh 一直为真，同一个包每 50ms 就被累加一次。实测
+   *   [V1030] face idle: rx=134 parsed=15 moved=73
+   * 15 个包驱动 73 次舵机动作。一个误检包（例如 cx=301，误差 199‰）
+   * 被乘 5 次，足以把 pan 从 110 连续减到 11 —— 用户看到的就是
+   * "跟着跟着突然乱转"。去重之后，一个包只产生一次修正，误检包
+   * 最多让云台偏一步，肉眼几乎看不出。 */
+  if (fresh && g_face.stamp_ms == g_consumed_stamp)
+    {
+      fresh = 0;
+    }
+
+  /* [V1263] 框贴在画面边缘时检测极不可靠：实测 cy 会漂到 44（框顶被裁掉），
+   * 云台就一路抬到限位。这类帧直接当"没脸"，让它回中位，别追。 */
+  if (fresh && (g_face.x < 60 || g_face.x > 940 ||
+                g_face.y < 120 || g_face.y > 880))
+    {
+      fresh = 0;
+    }
+
 #if COMPANION_FACE_ON_GIMBAL
   if (fresh)
     {
       /* 比例累积律：摄像头在云台上，头转会改变画面，所以有负反馈。 */
       float gain = CF_KP;
       int ex, ey;
+      int dpan = 0;
+      int dtilt = 0;
+      int g_damp = 0;   /* [V1271] 误差变化率 */
+      int step_cap = CF_STEP_MAX;
       int too_close;
+
+      g_consumed_stamp = g_face.stamp_ms;
+
+      /* [V1270] 包间隔过长说明 K230 那边检测不稳（实测有过 5 秒才来一个包），
+       * 这种孤立包不可信，只做小幅修正，别让它把云台甩走。 */
+      if (g_prev_pkt_ms != 0 && (g_face.stamp_ms - g_prev_pkt_ms) > 500)
+        {
+          step_cap = 6;   /* [V1275] 4 -> 6 */
+        }
+
+      g_prev_pkt_ms = g_face.stamp_ms;
 
       if (g_face.w > 150)
         {
@@ -580,42 +644,146 @@ static void cf_update_targets(void)
       ex = (g_face.x - 500) * CAM_PAN_SIGN;
       ey = (g_face.y - 500) * CAM_TILT_SIGN;
 
+      /* [V1271] 微分阻尼：把误差变化率折算成"每 200ms 变化多少千分比"，
+       * 包间隔忽长忽短时阻尼力度才不会飘。 */
+      {
+        int64_t dt = (g_prev_ex_valid)
+                     ? (g_face.stamp_ms - g_prev_ex_stamp) : 0;
+
+        if (g_prev_ex_valid && dt > 20 && dt < 800)
+          {
+            g_damp = (int)(((int64_t)(ex - g_prev_ex) * 200) / dt);
+            g_damp = clampi(g_damp, -600, 600);
+          }
+
+        g_prev_ex = ex;
+        g_prev_ex_stamp = g_face.stamp_ms;
+        g_prev_ex_valid = 1;
+      }
+
       /* 贴脸时再转也没意义，只会猛甩。 */
       too_close = (g_face.w > 400 || g_face.h > 400);
 
       if (absi(ex) > CF_DEADBAND && !too_close)
         {
-          g_pan_target = clampi(g_pan_target + (int)(-ex * gain),
-                                CF_PAN_MIN, CF_PAN_MAX);
+          /* [V1267] 浮点余数累积：原来 (int)(-ex*gain) 在 ex=30、gain=0.015 时
+           * 得 0.45，直接截断成 0 —— 误差小于 67 千分比就永远不动，这就是
+           * "人在画面里偏一点云台却不修"的原因。改为先累加再取整，余数保留。 */
+          g_pan_acc += (-ex * gain - g_damp * CF_KP_D);
+          dpan = (int)g_pan_acc;
+          if (dpan != 0)
+            {
+              g_pan_acc -= (float)dpan;
+              dpan = clampi(dpan, -step_cap, step_cap);
+              g_pan_target = clampi(g_pan_target + dpan, CF_PAN_MIN, CF_PAN_MAX);
+
+              /* 已经顶到限位就清空余数，免得离开限位时猛地一跳。 */
+              if (g_pan_target <= CF_PAN_MIN || g_pan_target >= CF_PAN_MAX)
+                {
+                  g_pan_acc = 0.0f;
+                }
+            }
         }
 
-      if (absi(ey) > CF_DEADBAND && !too_close)
+      /* [V1272] 恢复垂直跟随。
+       *
+       * [V1269] 当时关掉是对的：K230 送来的 cy 是 39..962 的噪声。
+       * K230 v49 之后 cy 已经稳定（456 包，中位 588，末段标准差 0.9），
+       * 现在开回来，人蹲下云台才会低头跟。
+       *
+       * 停机点 CF_TILT_SETPOINT=560 而不是 500：摄像头略高于人脸，
+       * 平视时脸本来就落在中线偏下，硬拉 500 等于让头永久轻微下压。 */
+      if (!too_close)
         {
-          g_tilt_target = clampi(g_tilt_target + (int)(-ey * gain),
-                                 CF_TILT_MIN, CF_TILT_MAX);
+          int eyn = g_face.y - CF_TILT_SETPOINT;
+          int dy_damp = 0;
+          int64_t dty = (g_prev_ey_valid)
+                        ? (g_face.stamp_ms - g_prev_ey_stamp) : 0;
+
+          if (g_prev_ey_valid && dty > 20 && dty < 800)
+            {
+              dy_damp = (int)(((int64_t)(eyn - g_prev_ey) * 200) / dty);
+              dy_damp = clampi(dy_damp, -600, 600);
+            }
+
+          g_prev_ey = eyn;
+          g_prev_ey_stamp = g_face.stamp_ms;
+          g_prev_ey_valid = 1;
+
+          if (absi(eyn) > CF_TILT_DEADBAND)
+            {
+              g_tilt_acc += (-(float)eyn * CF_TILT_KP * (float)CAM_TILT_SIGN
+                             - (float)dy_damp * CF_TILT_KP_D);
+              dtilt = (int)g_tilt_acc;
+              if (dtilt != 0)
+                {
+                  g_tilt_acc -= (float)dtilt;
+                  dtilt = clampi(dtilt, -CF_TILT_STEP_MAX, CF_TILT_STEP_MAX);
+                  g_tilt_target = clampi(g_tilt_target + dtilt,
+                                         CF_TILT_MIN, CF_TILT_MAX);
+                  if (g_tilt_target <= CF_TILT_MIN
+                      || g_tilt_target >= CF_TILT_MAX)
+                    {
+                      g_tilt_acc = 0.0f;
+                    }
+                }
+            }
         }
 
-      /* 远处抬一点头，做出"注视"的拟人感。 */
-      if (g_face.w > 0 && g_face.w < 120)
+
+      /* [V1266] 删掉"远处抬一点头"（原来 w<120 就每拍 tilt-1，实测 w 恒 46，
+       * 等于每秒往下压 20 度 —— 这就是"识别到人就低头"的直接元凶）。
+       * 需要拟人感的话应该做成低频、有上限的微动作，不能每拍减。 */
+
+      /* [V1266] 发散保护：如果连续 2 秒都贴在 pan 限位上（正常跟脸不会这样），
+       * 说明方向或增益出了问题，回中位重新收敛，避免一直甩在极端角度。 */
+      if (g_pan_target <= CF_PAN_MIN + 2 || g_pan_target >= CF_PAN_MAX - 2)
         {
-          g_tilt_target = clampi(g_tilt_target - 1,
-                                 CF_TILT_MIN, CF_TILT_MAX);
+          if (g_pin_since_ms == 0)
+            {
+              g_pin_since_ms = t;
+            }
+          else if (t - g_pin_since_ms > 2000)
+            {
+              syslog(LOG_WARNING,
+                     "[%s] [V1266] pan pinned at limit %d for 2 s, recenter\n",
+                     TAG, g_pan_target);
+              g_pan_target = 90;
+              g_tilt_target = 90;
+              g_pin_since_ms = 0;
+            }
+        }
+      else
+        {
+          g_pin_since_ms = 0;
         }
 
       g_last_sweep_ms = t;
     }
   else if (t - g_last_sweep_ms > CF_LOST_FACE_MS)
     {
-      /* 跟丢了：扫视找人（摄像头在云台上，扫视真的能扫到人）。 */
-      if (t - g_last_sweep_ms > 400)
+      /* 跟丢了：扫视找人（摄像头在云台上，扫视真的能扫到人）。
+       *
+       * [V1265] 原来只朝一个方向 +6，撞到 CF_PAN_MAX 就钳成 MAX-6，
+       * 下一拍再加又到顶 —— 结果云台卡在右端小幅抖动，等于没在扫。
+       * 改成 90 度上下 30 度来回扫，幅度不大、看着像在"张望"。 */
+      static int s_sweep_dir = 1;
+
+      if (t - g_last_sweep_ms > 600)
         {
-          g_pan_target = clampi(g_pan_target + 6, CF_PAN_MIN, CF_PAN_MAX);
-          if (g_pan_target >= CF_PAN_MAX)
+          g_pan_target = clampi(g_pan_target + 5 * s_sweep_dir,
+                                CF_PAN_CENTER - CF_SWEEP_SPAN,
+                                CF_PAN_CENTER + CF_SWEEP_SPAN);
+          if (g_pan_target >= CF_PAN_CENTER + CF_SWEEP_SPAN)
             {
-              g_pan_target = CF_PAN_MAX - 6;
+              s_sweep_dir = -1;
+            }
+          else if (g_pan_target <= CF_PAN_CENTER - CF_SWEEP_SPAN)
+            {
+              s_sweep_dir = 1;
             }
 
-          g_tilt_target = 90;
+          /* [V1272] 保持当前 tilt：丢脸一瞬间抬回 90 看着像抽搐 */
           g_last_sweep_ms = t;
         }
     }
